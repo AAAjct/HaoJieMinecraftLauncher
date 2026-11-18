@@ -2,7 +2,6 @@ package main
 
 import (
 	_ "embed"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +23,11 @@ var (
 	danger      = ui.Hex("#FF8585")
 	line        = ui.Hex("#334459")
 	scrollToTop = ui.Animation{Duration: 260 * time.Millisecond}
+	pageMotion  = ui.ElementTransition{
+		Animation:    &ui.Animation{Duration: 220 * time.Millisecond, Delay: 65 * time.Millisecond},
+		ExitDuration: 115 * time.Millisecond, ExitDelay: -1, ExitEase: ui.EaseIn,
+		Position: true, Enter: &ui.Motion{Y: 12}, Exit: &ui.Motion{Y: -6},
+	}
 )
 
 func panel(c *ui.Context) ui.Element {
@@ -41,9 +45,14 @@ func (a *app) view(c *ui.Context) {
 				if button.Hovered() {
 					button.Background(ui.Hex("#3980CF"))
 				}
+				var selected float32
 				if a.page == label {
+					selected = 1
+				}
+				underline := button.AnimateWith("selected", selected, 150*time.Millisecond, ui.EaseOut)
+				if underline > 0 {
 					button.DrawOver(func(p *ui.Painter, r ui.Rect) {
-						p.Fill(ui.Rect{X: r.X + r.W/2 - 12, Y: r.Y + r.H - 2, W: 24, H: 2}, white, 1)
+						p.Fill(ui.Rect{X: r.X + r.W/2 - 12, Y: r.Y + r.H - 2, W: 24, H: 2}, white.Alpha(underline), 1)
 					})
 				}
 				button.Children(func() { ui.Text(c, label).FontSize(15).Bold().TextColor(white) })
@@ -60,23 +69,15 @@ func (a *app) view(c *ui.Context) {
 			}
 		})
 		ui.Row(c).Grow(1).AlignItems(ui.Stretch).Children(func() {
-			if a.page == launchPage {
-				a.animatePage(c, ui.Column(c).Shrink(0)).Children(func() { a.launchSidebar(c) })
-			} else if a.page == downloadsPage {
-				a.downloadSidebar(c)
-			} else if a.page == tasksPage {
-				a.taskSidebar(c)
-			} else {
-				a.instanceList(c)
-			}
-			scrollKey := a.page
+			a.pageSidebar(c)
+			scrollKey := [4]string{a.page}
 			if a.page == downloadsPage {
-				scrollKey += a.resourceKind + a.project.ID + a.targetVersion
+				scrollKey = [4]string{a.page, a.resourceKind, a.project.ID, a.targetVersion}
 			}
-			ui.Column(c).Grow(1).Children(func() {
+			ui.Column(c).Grow(1).Clip().Children(func() {
 				if a.page != launchPage {
-					ui.Scroll(c).Key(scrollKey).TrackScroll(&a.mainScroll).Grow(1).Padding(18, 62, 18, 18).Children(func() {
-						a.animatePage(c, ui.Column(c).Gap(12)).Children(func() {
+					ui.Scroll(c).Key(scrollKey).Transition(pageMotion).TrackScroll(&a.mainScroll).Grow(1).Padding(18, 62, 18, 18).Children(func() {
+						ui.Column(c).Gap(12).Children(func() {
 							switch a.page {
 							case downloadsPage:
 								a.downloadView(c)
@@ -135,17 +136,27 @@ func (a *app) view(c *ui.Context) {
 	})
 }
 
-func (a *app) animatePage(c *ui.Context, body ui.Element) ui.Element {
-	if !a.pageChanged.IsZero() && !c.Preferences().ReduceMotion {
-		progress := float32(time.Since(a.pageChanged)) / float32(320*time.Millisecond)
-		if progress >= 0 && progress < 1 {
-			c.AnimationFrame()
-			left := 1 - progress
-			scale := 1 - 0.055*left*left*float32(math.Cos(float64(progress)*7))
-			body.Opacity(0.65+0.35*ui.EaseOut(progress)).Scale(scale, scale).TransformOrigin(0.5, 0.5)
-		}
+func (a *app) pageSidebar(c *ui.Context) {
+	width, background := float32(218), ui.Hex("#202836")
+	if a.page == launchPage {
+		width, background = 278, ui.Hex("#202631")
 	}
-	return body
+	sidebar := ui.Column(c).Shrink(0).Background(background).Clip()
+	sidebar.Width(sidebar.AnimateWith("width", width, 220*time.Millisecond, ui.EaseInOut)).
+		Children(func() {
+			ui.Column(c).Key(a.page).Grow(1).Transition(pageMotion).Children(func() {
+				switch a.page {
+				case launchPage:
+					a.launchSidebar(c)
+				case downloadsPage:
+					a.downloadSidebar(c)
+				case tasksPage:
+					a.taskSidebar(c)
+				case managePage:
+					a.instanceList(c)
+				}
+			})
+		})
 }
 
 func circleButton(c *ui.Context, label, symbol string) ui.Element {
@@ -157,13 +168,12 @@ func circleButton(c *ui.Context, label, symbol string) ui.Element {
 	button.DrawOver(func(p *ui.Painter, r ui.Rect) {
 		x, y := r.X+r.W/2, r.Y+r.H/2
 		if symbol == "×" {
-			p.Line(x-5, y-5, x+5, y+5, 2, white)
-			p.Line(x-5, y+5, x+5, y-5, 2, white)
+			p.StrokePolyline([][2]float32{{x - 5, y - 5}, {x + 5, y + 5}}, 2, white)
+			p.StrokePolyline([][2]float32{{x - 5, y + 5}, {x + 5, y - 5}}, 2, white)
 			return
 		}
 		p.Line(x, y-6, x, y+6, 2, white)
-		p.Line(x-5, y-1, x, y-6, 2, white)
-		p.Line(x, y-6, x+5, y-1, 2, white)
+		p.StrokePolyline([][2]float32{{x - 5, y - 1}, {x, y - 6}, {x + 5, y - 1}}, 2, white)
 	})
 	return button
 }
@@ -193,7 +203,7 @@ func (a *app) windowButtons(c *ui.Context) {
 }
 
 func (a *app) instanceList(c *ui.Context) {
-	a.animatePage(c, ui.Column(c).Width(218).Shrink(0).Background(ui.Hex("#202836")).Padding(15).Gap(9)).Children(func() {
+	ui.Column(c).Grow(1).Padding(15).Gap(9).Children(func() {
 		ui.Text(c, "我的实例").FontSize(16).Bold()
 		if len(a.instances) == 0 {
 			ui.Text(c, "安装游戏版本或导入整合包后，实例会出现在这里。").
@@ -229,7 +239,7 @@ func (a *app) instanceList(c *ui.Context) {
 
 func (a *app) launchSidebar(c *ui.Context) {
 	i := a.current()
-	ui.Column(c).Width(278).Grow(1).Padding(20).Gap(11).Background(ui.Hex("#202631")).Children(func() {
+	ui.Column(c).Grow(1).Padding(20).Gap(11).Children(func() {
 		ui.Spacer(c).Grow(1)
 		ui.Column(c).Gap(14).AlignItems(ui.Center).Children(func() {
 			ui.Image(c, steveAvatar).Size(64, 64).Label("史蒂夫头像")
@@ -272,7 +282,7 @@ func (a *app) manageView(c *ui.Context) {
 		ui.Textf(c, "%s · %s", i.Version, loaderName(i)).TextColor(a.theme.TextMuted)
 		a.renameInstanceView(c, i)
 		folder := a.engine.GameDir(i)
-		ui.Row(c).Gap(8).Children(func() {
+		ui.Row(c).Gap(8).Wrap().Children(func() {
 			if ui.Button(c, "打开游戏目录").Clicked() {
 				a.openFile(folder)
 			}
@@ -283,6 +293,10 @@ func (a *app) manageView(c *ui.Context) {
 				} else {
 					a.openFile(mods)
 				}
+			}
+			if ui.Button(c, "刷新模组").Clicked() {
+				a.status = "已刷新模组列表。"
+				a.refreshMods()
 			}
 			if ui.Button(c, "从文件安装").Disabled(a.busy(downloadJob) || a.inUse(i)).Clicked() {
 				a.chooseFiles()

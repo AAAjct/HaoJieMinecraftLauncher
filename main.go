@@ -70,7 +70,6 @@ type app struct {
 	jobs                         map[jobKind]*job
 	closing                      bool
 	downloadTarget, launchTarget string
-	pageChanged                  time.Time
 	importConfirm                bool
 	pendingImport                importRequest
 }
@@ -100,7 +99,7 @@ func (a *app) inUse(i engine.Instance) bool {
 
 func (a *app) navigate(page string) {
 	if a.page != page {
-		a.page, a.pageChanged = page, time.Now()
+		a.page = page
 		a.mainScroll.Y = 0
 	}
 	if page == managePage {
@@ -453,7 +452,6 @@ func (a *app) loadProject(p engine.Project) {
 		a.fileGame, a.fileLoader = state.game, state.loader
 		a.resourceTarget = a.selected
 		clear(a.openResourceGroups)
-		a.pageChanged = time.Now()
 		a.mainScroll.Y = 0
 		a.status = "项目版本已加载。"
 	}

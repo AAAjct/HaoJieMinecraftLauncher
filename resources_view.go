@@ -293,7 +293,6 @@ func (a *app) resourceDetails(c *ui.Context) {
 	panel(c).Children(func() {
 		if ui.Button(c, "返回搜索结果").AlignSelf(ui.Start).Clicked() {
 			a.leaveProject()
-			a.pageChanged = time.Now()
 			return
 		}
 		ui.Row(c).Gap(12).Children(func() {

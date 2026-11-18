@@ -4,13 +4,12 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"time"
 
 	"github.com/egoist/mygo/ui"
 )
 
 func sidebar(c *ui.Context) ui.Element {
-	return ui.Column(c).Width(218).Shrink(0).Padding(14).Gap(8).Background(ui.Hex("#202836"))
+	return ui.Column(c).Grow(1).Padding(14).Gap(8)
 }
 
 func (a *app) sideButton(c *ui.Context, label string, selected bool) bool {
@@ -27,12 +26,11 @@ func (a *app) sideButton(c *ui.Context, label string, selected bool) bool {
 }
 
 func (a *app) downloadSidebar(c *ui.Context) {
-	a.animatePage(c, sidebar(c)).Children(func() {
+	sidebar(c).Children(func() {
 		for _, category := range []string{"游戏版本", "模组", "整合包", "光影"} {
 			if a.sideButton(c, category, category == a.resourceKind) && category != a.resourceKind {
 				a.resourceKind = category
 				a.leaveProject()
-				a.pageChanged = time.Now()
 				if category == "游戏版本" {
 					a.downloadVersions(false)
 				}
@@ -61,7 +59,7 @@ func taskProgress(message string) (progress float64, remaining string) {
 }
 
 func (a *app) taskSidebar(c *ui.Context) {
-	a.animatePage(c, sidebar(c)).Children(func() {
+	sidebar(c).Children(func() {
 		percentage, rate, remaining := "—", "—", "—"
 		if task := a.jobs[downloadJob]; task != nil {
 			progress, left := taskProgress(task.message)

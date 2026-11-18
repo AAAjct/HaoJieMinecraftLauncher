@@ -45,7 +45,6 @@ func (a *app) selectGame(version string) {
 	a.targetVersion = version
 	a.selectedLoader, a.selectedBuild = "", ""
 	clear(a.openLoaders)
-	a.pageChanged = time.Now()
 	a.mainScroll.Y = 0
 	a.preloadBuilds(version)
 }

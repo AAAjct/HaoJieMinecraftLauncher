@@ -42,6 +42,13 @@ func TestLongVersionListAndFloatingActions(t *testing.T) {
 	if !hasStop || !hasTop || top.X != stop.X || top.Y >= stop.Y || top.Y < 500 {
 		t.Fatalf("running game and long list should stack both actions at the lower right: %v %v", stop, top)
 	}
+	frame := test.Image()
+	x, y := int(stop.X+stop.W/2), int(stop.Y+stop.H/2)
+	for _, offset := range [][2]int{{-4, -4}, {4, -4}, {-4, 4}, {4, 4}} {
+		if pixel := frame.RGBAAt(x+offset[0], y+offset[1]); pixel.R < 200 || pixel.G < 200 || pixel.B < 200 {
+			t.Fatalf("missing diagonal stroke at %v in stop button: %v", offset, pixel)
+		}
+	}
 	status, found := test.Find("就绪")
 	middle := status.Y + status.H/2
 	if !found || middle < 656 || middle > 658 {
@@ -104,12 +111,18 @@ func TestManageRefreshAndRename(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(folder, "instance.json"), data, 0600); err != nil {
 		t.Fatal(err)
 	}
-	test := ui.NewTester(a.view, 1020, 675)
+	test := ui.NewTester(a.view, 830, 565)
 	if err := test.Click("实例管理"); err != nil {
 		t.Fatal(err)
 	}
+	test.Advance(time.Second)
 	if !test.HasText("26.3 · Fabric") || !test.HasText("打开模组目录") || test.HasText("刷新实例列表") {
 		t.Fatalf("instance was not reread on navigation: %q", test.Texts())
+	}
+	open, hasOpen := test.Find("打开模组目录")
+	refresh, hasRefresh := test.Find("刷新模组")
+	if !hasOpen || !hasRefresh || open.Y != refresh.Y || open.X+open.W > refresh.X {
+		t.Fatalf("refresh must be beside the mods folder button at minimum width: %v %v", open, refresh)
 	}
 	if err := test.Click("实例名称"); err != nil {
 		t.Fatal(err)
@@ -132,8 +145,14 @@ func TestManageRefreshAndRename(t *testing.T) {
 	if err := os.WriteFile(modPath, []byte("test"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := test.Click("实例管理"); err != nil {
+	if test.HasText("example.jar") {
+		t.Fatal("mod should not appear before refreshing")
+	}
+	if err := test.Click("刷新模组"); err != nil {
 		t.Fatal(err)
+	}
+	if len(a.mods) != 1 || a.mods[0].Filename != "example.jar.disabled" {
+		t.Fatalf("refresh did not reread the mod directory: %+v", a.mods)
 	}
 	if err := test.Click("删除"); err != nil {
 		t.Fatal(err)
@@ -273,6 +292,36 @@ func TestMainNavigation(t *testing.T) {
 		if !test.HasText(step.text) {
 			t.Fatalf("%s: missing %q in %q", step.button, step.text, test.Texts())
 		}
+	}
+}
+
+func TestPageTransitionAnimatesSidebarWidth(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	test := ui.NewTester(a.view, 1020, 675)
+	test.Frame()
+	background := test.Image().RGBAAt(300, 550)
+	sidebarEdge := func() int {
+		frame := test.Image()
+		for x := 200; x < 300; x++ {
+			if frame.RGBAAt(x, 550) == background {
+				return x
+			}
+		}
+		return 300
+	}
+	if edge := sidebarEdge(); edge != 278 {
+		t.Fatalf("starting sidebar width = %d", edge)
+	}
+	if err := test.Click("任务"); err != nil {
+		t.Fatal(err)
+	}
+	test.Advance(110 * time.Millisecond)
+	if edge := sidebarEdge(); edge <= 218 || edge >= 278 {
+		t.Fatalf("sidebar width should interpolate between pages, got %d", edge)
+	}
+	test.Advance(300 * time.Millisecond)
+	if edge := sidebarEdge(); edge != 218 || !test.HasText("任务管理") {
+		t.Fatalf("task page did not settle, sidebar width = %d", edge)
 	}
 }
 
