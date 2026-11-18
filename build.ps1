@@ -1,23 +1,21 @@
+param([string]$DistributionDirectory = (Join-Path $PSScriptRoot 'dist'))
+
 $ErrorActionPreference = 'Stop'
-$distribution = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot 'dist'))
+$distribution = [IO.Path]::GetFullPath($DistributionDirectory)
 $staging = Join-Path $distribution ('.stage-' + [Guid]::NewGuid().ToString('N'))
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    cargo build --release --locked --target x86_64-pc-windows-msvc --manifest-path runtime-helper/Cargo.toml
-    if ($LASTEXITCODE -ne 0) { throw 'Rust build failed.' }
-    New-Item -ItemType Directory -Path internal/engine/bin -Force | Out-Null
-    Copy-Item -LiteralPath runtime-helper/target/x86_64-pc-windows-msvc/release/hjml-runtime.exe -Destination internal/engine/bin/hjml-runtime.exe
     go tool mygo build -platform windows/amd64 -skip-installer -o $staging
     if ($LASTEXITCODE -ne 0) { throw 'MyGo build failed.' }
     $built = Join-Path $staging 'windows-amd64'
     $output = Join-Path $distribution 'windows-amd64'
     New-Item -ItemType Directory -Path $output -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $built 'icon.png') -Destination $output -Force
     $exe = Join-Path $output 'HaoJieMinecraftLauncher.exe'
-    if (Get-Process -Name HaoJieMinecraftLauncher -ErrorAction SilentlyContinue | Where-Object Path -EQ $exe) {
-        $exe = Join-Path $output ('HaoJieMinecraftLauncher-' + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.exe')
-    }
     Copy-Item -LiteralPath (Join-Path $built 'HaoJieMinecraftLauncher.exe') -Destination $exe -Force
+    $oldIcon = Join-Path $output 'icon.png'
+    if (Test-Path -LiteralPath $oldIcon -PathType Leaf) {
+        Remove-Item -LiteralPath $oldIcon -Force
+    }
     Write-Output "Built $exe"
 }
 finally {

@@ -84,7 +84,11 @@ func fetchJSON(ctx context.Context, url string, result any) error {
 		}
 		res, err := get(ctx, url)
 		if err == nil {
-			err = json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(result)
+			body := io.LimitReader(res.Body, 8<<20)
+			err = json.NewDecoder(body).Decode(result)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, body)
+			}
 			res.Body.Close()
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 				return err
@@ -99,41 +103,6 @@ func fetchJSON(ctx context.Context, url string, result any) error {
 		last = err
 	}
 	return last
-}
-
-func download(ctx context.Context, url, dir string, limit int64, label string, status func(string)) (string, error) {
-	status("正在下载 " + label + "…")
-	res, err := get(ctx, url)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-
-	file, err := os.CreateTemp(dir, "hjml-download-*")
-	if err != nil {
-		return "", err
-	}
-	ok := false
-	defer func() {
-		file.Close()
-		if !ok {
-			os.Remove(file.Name())
-		}
-	}()
-
-	progress := &downloadProgress{label: label, status: status, start: time.Now()}
-	size, err := copyHTTP(ctx, url, res, file, nil, limit, progress.add)
-	if err != nil {
-		return "", err
-	}
-	if size > limit {
-		return "", fmt.Errorf("%s 下载文件超过大小限制", label)
-	}
-	if err := file.Close(); err != nil {
-		return "", err
-	}
-	ok = true
-	return file.Name(), nil
 }
 
 type downloadProgress struct {

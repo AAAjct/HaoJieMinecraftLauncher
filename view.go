@@ -12,7 +12,7 @@ import (
 	"hjml/internal/engine"
 )
 
-//go:embed steve.png
+//go:embed resources/steve.png
 var stevePNG []byte
 
 var steveAvatar, _ = ui.DecodeImage(stevePNG)
@@ -21,6 +21,7 @@ var (
 	white       = ui.Hex("#F5FAFF")
 	blue        = ui.Hex("#246BBB")
 	highlight   = ui.Hex("#93CEFF")
+	danger      = ui.Hex("#FF8585")
 	line        = ui.Hex("#334459")
 	scrollToTop = ui.Animation{Duration: 260 * time.Millisecond}
 )
@@ -130,6 +131,7 @@ func (a *app) view(c *ui.Context) {
 			})
 		})
 		a.importDialog(c)
+		a.deleteInstanceDialog(c)
 	})
 }
 
@@ -152,7 +154,17 @@ func circleButton(c *ui.Context, label, symbol string) ui.Element {
 	if button.Hovered() {
 		button.Background(c.Theme().SurfaceHover)
 	}
-	button.Children(func() { ui.Text(c, symbol).FontSize(21).TextColor(white) })
+	button.DrawOver(func(p *ui.Painter, r ui.Rect) {
+		x, y := r.X+r.W/2, r.Y+r.H/2
+		if symbol == "×" {
+			p.Line(x-5, y-5, x+5, y+5, 2, white)
+			p.Line(x-5, y+5, x+5, y-5, 2, white)
+			return
+		}
+		p.Line(x, y-6, x, y+6, 2, white)
+		p.Line(x-5, y-1, x, y-6, 2, white)
+		p.Line(x, y-6, x+5, y-1, 2, white)
+	})
 	return button
 }
 
@@ -182,13 +194,7 @@ func (a *app) windowButtons(c *ui.Context) {
 
 func (a *app) instanceList(c *ui.Context) {
 	a.animatePage(c, ui.Column(c).Width(218).Shrink(0).Background(ui.Hex("#202836")).Padding(15).Gap(9)).Children(func() {
-		ui.Row(c).Children(func() {
-			ui.Text(c, "我的实例").FontSize(16).Bold()
-			ui.Spacer(c).Grow(1)
-			if ui.Button(c, "刷新").Label("刷新实例列表").Clicked() {
-				a.refreshInstances()
-			}
-		})
+		ui.Text(c, "我的实例").FontSize(16).Bold()
 		if len(a.instances) == 0 {
 			ui.Text(c, "安装游戏版本或导入整合包后，实例会出现在这里。").
 				FontSize(13).TextColor(a.theme.TextMuted)
@@ -202,20 +208,13 @@ func (a *app) instanceList(c *ui.Context) {
 						label += " · 运行中"
 					}
 					tooltip := i.Name + " · " + i.Version + " · " + loaderName(i)
-					if i.ID == a.selected {
-						tooltip = "再次点击以修改实例名"
-					}
 					button := ui.Button(c, label).Key(i.ID).Tooltip(tooltip).
 						Height(38).MaxLines(1)
 					if i.ID == a.selected {
 						button.TextColor(highlight).Bold()
 					}
 					if button.Clicked() {
-						if i.ID == a.selected {
-							a.renaming, a.renameValue = i.ID, i.Name
-						} else {
-							a.selectInstance(i)
-						}
+						a.selectInstance(i)
 					}
 				}
 			})
@@ -266,16 +265,12 @@ func (a *app) launchSidebar(c *ui.Context) {
 func (a *app) manageView(c *ui.Context) {
 	i := a.current()
 	panel(c).Children(func() {
-		ui.Text(c, "实例管理").FontSize(21).Bold()
 		if i.ID == "" {
 			ui.Text(c, "安装实例后可在此管理模组。").TextColor(a.theme.TextMuted)
 			return
 		}
-		if a.renaming == i.ID {
-			a.renameInstanceView(c, i)
-		} else {
-			ui.Textf(c, "%s - [%s · %s]", i.Name, i.Version, loaderName(i)).Bold()
-		}
+		ui.Textf(c, "%s · %s", i.Version, loaderName(i)).TextColor(a.theme.TextMuted)
+		a.renameInstanceView(c, i)
 		folder := a.engine.GameDir(i)
 		ui.Row(c).Gap(8).Children(func() {
 			if ui.Button(c, "打开游戏目录").Clicked() {
@@ -289,11 +284,11 @@ func (a *app) manageView(c *ui.Context) {
 					a.openFile(mods)
 				}
 			}
-			if ui.Button(c, "刷新").Label("刷新实例与模组").Clicked() {
-				a.refreshInstances()
-			}
 			if ui.Button(c, "从文件安装").Disabled(a.busy(downloadJob) || a.inUse(i)).Clicked() {
 				a.chooseFiles()
+			}
+			if ui.Button(c, "删除实例").TextColor(danger).Disabled(a.inUse(i)).Clicked() {
+				a.deleteConfirm = true
 			}
 		})
 	})
@@ -317,17 +312,17 @@ func (a *app) manageView(c *ui.Context) {
 			if name == "" {
 				name = strings.TrimSuffix(mod.Filename, ".disabled")
 			}
-			name = bilingualName(name, mod.ID)
+			name = a.bilingualName(name, mod.ID)
 			if !matchesSearch(name+" "+mod.Filename, a.modFilter) {
 				continue
 			}
 			ui.Divider(c)
 			ui.Row(c).Gap(8).Children(func() {
-				ui.Text(c, name).Grow(1).MaxLines(1).Tooltip(mod.Filename)
+				text := ui.Text(c, name).Grow(1).MaxLines(1).Tooltip(mod.Filename)
 				label := "禁用"
 				if !mod.Enabled {
 					label = "启用"
-					ui.Text(c, "已禁用").TextColor(a.theme.TextMuted).FontSize(12)
+					text.TextColor(ui.Hex("#A0A0A0")).Strikethrough()
 				}
 				if ui.Button(c, label).Disabled(busy).Clicked() {
 					if err := a.engine.ToggleMod(i, mod); err != nil {
@@ -337,21 +332,13 @@ func (a *app) manageView(c *ui.Context) {
 						a.refreshMods()
 					}
 				}
-				if a.DeleteTarget == mod.Filename {
-					if ui.Button(c, "取消").Clicked() {
-						a.DeleteTarget = ""
+				if ui.Button(c, "删除").TextColor(danger).Disabled(busy).Clicked() {
+					if err := a.engine.RemoveMod(i, mod); err != nil {
+						a.status = err.Error()
+					} else {
+						a.status = "模组已删除。"
+						a.refreshMods()
 					}
-					if ui.Button(c, "确认删除").Disabled(busy).Clicked() {
-						if err := a.engine.RemoveMod(i, mod); err != nil {
-							a.status = err.Error()
-						} else {
-							a.status = "模组已删除。"
-							a.refreshMods()
-						}
-						a.DeleteTarget = ""
-					}
-				} else if ui.Button(c, "删除").Disabled(busy).Clicked() {
-					a.DeleteTarget = mod.Filename
 				}
 			})
 		}
@@ -359,20 +346,45 @@ func (a *app) manageView(c *ui.Context) {
 }
 
 func (a *app) renameInstanceView(c *ui.Context, instance engine.Instance) {
-	ui.Row(c).Gap(8).Children(func() {
-		input := ui.TextInput(c, &a.renameValue).Key(instance.ID).Label("实例名称").Grow(1).AutoFocus()
+	ui.Row(c).Key(instance.ID).Gap(8).Children(func() {
+		input := ui.TextInput(c, &a.renameValue).Label("实例名称").Grow(1)
 		if ui.PrimaryButton(c, "保存名称").Clicked() || input.Submitted() {
 			if err := a.engine.RenameInstance(instance, a.renameValue); err != nil {
 				a.status = err.Error()
 				return
 			}
-			a.renaming = ""
 			a.refreshInstances()
 			a.status = "已修改实例名称。"
 		}
-		if ui.Button(c, "取消改名").Clicked() {
-			a.renaming = ""
-		}
+	})
+}
+
+func (a *app) deleteInstanceDialog(c *ui.Context) {
+	ui.Modal(c, &a.deleteConfirm, func() {
+		i := a.current()
+		ui.Column(c).Width(420).Gap(12).Padding(20).Children(func() {
+			ui.Text(c, "删除实例").FontSize(21).Bold().Focusable().AutoFocus()
+			ui.Textf(c, "删除「%s」及其中的存档、模组和配置？", i.Name)
+			ui.Row(c).Justify(ui.End).Gap(8).Children(func() {
+				if ui.Button(c, "取消").Clicked() {
+					a.deleteConfirm = false
+				}
+				if ui.Button(c, "确认删除实例").TextColor(danger).Disabled(a.inUse(i)).Clicked() {
+					a.deleteConfirm = false
+					if err := a.engine.RemoveInstance(i); err != nil {
+						a.status = err.Error()
+						return
+					}
+					a.modFilter = ""
+					a.refreshInstances()
+					a.settings.Instance = a.selected
+					a.status = "已删除实例。"
+					if err := a.engine.SaveSettings(a.settings); err != nil {
+						a.status = err.Error()
+					}
+				}
+			})
+		})
 	})
 }
 

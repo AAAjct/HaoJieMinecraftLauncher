@@ -367,24 +367,25 @@ func (e Engine) installGame(ctx context.Context, instance Instance, status func(
 	if err != nil {
 		return profile, err
 	}
-	if err := ensureAll(ctx, packages, "下载 Minecraft 和运行库", status); err != nil {
+	assets, err := e.assetTransfers(ctx, profile)
+	if err != nil {
 		return profile, err
 	}
-	return profile, e.ensureAssets(ctx, profile, status)
+	return profile, ensureAll(ctx, append(packages, assets...), "下载 Minecraft、运行库和资源", status)
 }
 
-func (e Engine) ensureAssets(ctx context.Context, profile gameProfile, status func(string)) error {
+func (e Engine) assetTransfers(ctx context.Context, profile gameProfile) ([]transfer, error) {
 	if !segment(profile.AssetIndex.ID) || profile.AssetIndex.URL == "" {
-		return fmt.Errorf("版本缺少资源索引")
+		return nil, fmt.Errorf("版本缺少资源索引")
 	}
 	assets := filepath.Join(e.gameRoot(), "assets")
 	indexPath := filepath.Join(assets, "indexes", profile.AssetIndex.ID+".json")
 	if err := (transfer{profile.AssetIndex.artifact, indexPath}).ensure(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	var index assetIndex
 	if err := readJSON(indexPath, &index); err != nil {
-		return err
+		return nil, err
 	}
 	files := make([]transfer, 0, len(index.Objects))
 	seen := map[string]bool{}
@@ -393,16 +394,19 @@ func (e Engine) ensureAssets(ctx context.Context, profile gameProfile, status fu
 			continue
 		}
 		if !validAssetHash(entry.Hash) {
-			return fmt.Errorf("Mojang 资源索引包含无效哈希")
+			return nil, fmt.Errorf("Mojang 资源索引包含无效哈希")
 		}
 		seen[entry.Hash] = true
 		relative := entry.Hash[:2] + "/" + entry.Hash
 		files = append(files, transfer{
-			artifact: artifact{URL: "https://resources.download.minecraft.net/" + relative, Size: entry.Size, SHA1: entry.Hash},
-			target:   filepath.Join(assets, "objects", filepath.FromSlash(relative)),
+			artifact: artifact{
+				URL: "https://resources.download.minecraft.net/" + relative, Size: entry.Size, SHA1: entry.Hash,
+				Mirrors: []string{bmcl + "/assets/" + relative},
+			},
+			target: filepath.Join(assets, "objects", filepath.FromSlash(relative)),
 		})
 	}
-	return ensureAll(ctx, files, "检查游戏资源", status)
+	return files, nil
 }
 
 var assetHash = regexp.MustCompile(`^[0-9a-f]{40}$`)

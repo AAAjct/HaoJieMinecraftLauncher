@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -23,20 +25,20 @@ const (
 )
 
 type app struct {
-	engine                engine.Engine
-	window                *mygo.Window
-	theme                 *ui.Theme
-	page                  string
-	settings              engine.Settings
-	nickname              string
-	instances             []engine.Instance
-	selected              string
-	mods                  []engine.Mod
-	DeleteTarget          string
-	modFilter             string
-	renaming, renameValue string
-	running               map[string]*engine.Game
-	stopLaunch            bool
+	engine        engine.Engine
+	window        *mygo.Window
+	theme         *ui.Theme
+	page          string
+	settings      engine.Settings
+	nickname      string
+	instances     []engine.Instance
+	selected      string
+	mods          []engine.Mod
+	deleteConfirm bool
+	modFilter     string
+	renameValue   string
+	running       map[string]*engine.Game
+	stopLaunch    bool
 
 	versionList                                []engine.Version
 	versionStamp                               time.Time
@@ -53,6 +55,8 @@ type app struct {
 	resourceKind                               string
 	resourceSearches                           map[string]*resourceSearch
 	activeSearch                               *resourceSearch
+	modNames                                   *engine.ModNames
+	loadModNames                               func() *engine.ModNames
 	project                                    engine.Project
 	resourceGroups                             []resourceGroup
 	openResourceGroups                         map[loaderKey]bool
@@ -96,10 +100,9 @@ func (a *app) navigate(page string) {
 	if a.page != page {
 		a.page, a.pageChanged = page, time.Now()
 		a.mainScroll.Y = 0
-		a.renaming = ""
-		if page == managePage {
-			a.refreshInstances()
-		}
+	}
+	if page == managePage {
+		a.refreshInstances()
 	}
 }
 
@@ -157,11 +160,12 @@ func (a *app) refreshInstances() {
 		a.status = err.Error()
 	}
 	if a.current().ID == "" {
-		a.selected, a.renaming = "", ""
+		a.selected = ""
 		if len(a.instances) > 0 {
 			a.selected = a.instances[0].ID
 		}
 	}
+	a.renameValue = a.current().Name
 	a.refreshMods()
 }
 
@@ -181,12 +185,11 @@ func (a *app) selectInstance(i engine.Instance) {
 		return
 	}
 	a.selected = i.ID
-	a.renaming = ""
+	a.renameValue = i.Name
 	a.settings.Instance = i.ID
 	if err := a.engine.SaveSettings(a.settings); err != nil {
 		a.status = err.Error()
 	}
-	a.DeleteTarget = ""
 	a.modFilter = ""
 	a.refreshMods()
 	a.preloadBuilds(i.Version)
@@ -302,7 +305,7 @@ func (a *app) play(i engine.Instance) {
 						if game.Stopping {
 							a.status = "已结束 Minecraft · " + i.Name
 						} else if err != nil {
-							a.status = "游戏异常退出，可在实例管理页查看启动日志。"
+							a.status = "游戏异常退出，请在游戏目录查看 hjml-latest.log。"
 						}
 					}
 				})
@@ -351,7 +354,19 @@ type resourceSearch struct {
 	query, submitted, game, loader string
 	results                        []engine.Project
 	page, total, requested         int
-	loaded, failed                 bool
+	loaded, failed, pending        bool
+	cache                          map[searchKey]searchResult
+}
+
+type searchKey struct {
+	query, game, loader string
+	page                int
+}
+
+type searchResult struct {
+	hits  []engine.Project
+	total int
+	at    time.Time
 }
 
 func (a *app) search(page int) {
@@ -360,19 +375,50 @@ func (a *app) search(page int) {
 		return
 	}
 	state := a.resourceSearches[kind]
-	state.requested, state.failed = page, false
+	state.requested, state.failed, state.pending = page, false, false
+	key := searchKey{state.submitted, state.game, state.loader, page}
+	show := func(result searchResult) {
+		state.results, state.total, state.page, state.loaded = result.hits, result.total, page, true
+		if a.page == downloadsPage && a.kind() == kind {
+			a.mainScroll.Y = 0
+		}
+		a.fetchProjectIcons(result.hits)
+		a.status = "搜索完成。"
+	}
+	if result, ok := state.cache[key]; ok && time.Since(result.at) < 5*time.Minute {
+		show(result)
+		return
+	}
 	a.activeSearch = state
-	query := searchName(state.submitted)
-	filter := engine.Instance{Version: state.game, Loader: state.loader}
+	lookup := a.loadModNames
 	a.start(catalogJob, "正在搜索 Modrinth…", func(ctx context.Context, _ func(string)) (func(), error) {
-		hits, total, err := engine.Search(ctx, kind, query, filter, page)
-		return func() {
-			state.results, state.total, state.page, state.loaded = hits, total, page, true
-			if a.page == downloadsPage && a.kind() == kind {
-				a.mainScroll.Y = 0
+		query := key.query
+		var names *engine.ModNames
+		translatedSearch := kind == "mod" && lookup != nil && strings.ContainsFunc(query, func(r rune) bool { return unicode.Is(unicode.Han, r) })
+		if translatedSearch {
+			names = lookup()
+			if slug := names.SearchSlug(query); slug != "" {
+				query = strings.ReplaceAll(slug, "-", " ")
 			}
-			a.fetchProjectIcons(hits)
-			a.status = "搜索完成。"
+		}
+		searchCtx, cancel := context.WithTimeout(ctx, 18*time.Second)
+		defer cancel()
+		hits, total, err := engine.Search(searchCtx, kind, query, engine.Instance{Version: key.game, Loader: key.loader}, page)
+		return func() {
+			if state.pending {
+				return
+			}
+			if names != nil {
+				a.modNames = names
+			}
+			result := searchResult{hits, total, time.Now()}
+			if state.cache == nil || len(state.cache) >= 48 {
+				state.cache = make(map[searchKey]searchResult)
+			}
+			if !translatedSearch || names != nil {
+				state.cache[key] = result
+			}
+			show(result)
 		}, err
 	})
 }
@@ -380,6 +426,7 @@ func (a *app) search(page int) {
 func (a *app) submitResourceSearch(state *resourceSearch) {
 	state.submitted = strings.TrimSpace(state.query)
 	state.results, state.page, state.total, state.loaded = nil, 0, 0, false
+	state.pending = true
 	a.search(0)
 }
 
@@ -479,6 +526,25 @@ func main() {
 	catalogCtx, stopCatalog := context.WithCancel(context.Background())
 	defer stopCatalog()
 	a.catalogContext = catalogCtx
+	var namesMu sync.Mutex
+	var names *engine.ModNames
+	var retryNamesAfter time.Time
+	a.loadModNames = func() *engine.ModNames {
+		namesMu.Lock()
+		defer namesMu.Unlock()
+		if names != nil || time.Now().Before(retryNamesAfter) {
+			return names
+		}
+		ctx, cancel := context.WithTimeout(catalogCtx, 8*time.Second)
+		defer cancel()
+		var err error
+		names, err = a.engine.LoadModNames(ctx)
+		if err != nil {
+			retryNamesAfter = time.Now().Add(10 * time.Second)
+			log.Printf("读取模组中文索引：%v", err)
+		}
+		return names
+	}
 	if err := os.MkdirAll(gameRoot, 0700); err != nil {
 		a.status = "无法创建 .minecraft：" + err.Error()
 	}
@@ -489,6 +555,12 @@ func main() {
 		})
 		removeWindowBorder(a.window)
 		a.window.OnClosed(stopCatalog)
+		go func() {
+			names := a.loadModNames()
+			if catalogCtx.Err() == nil {
+				a.window.Update(func() { a.modNames = names })
+			}
+		}()
 		a.downloadVersions(false)
 		a.preloadRecentBuilds()
 		go func() {

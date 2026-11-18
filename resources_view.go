@@ -85,8 +85,9 @@ func (a *app) fetchProjectIcons(projects []engine.Project) {
 }
 
 func (a *app) projectIcon(c *ui.Context, project engine.Project, size float32) {
+	label := project.Title + " 图标"
 	if icon := a.projectIcons[project.IconURL]; icon != nil {
-		ui.Image(c, icon).Size(size, size).Shrink(0).Radius(8).Label(project.Title)
+		ui.Image(c, icon).Size(size, size).Shrink(0).Radius(8).Label(label)
 		return
 	}
 	initial := "?"
@@ -94,7 +95,7 @@ func (a *app) projectIcon(c *ui.Context, project engine.Project, size float32) {
 		initial = strings.ToUpper(string(letter))
 		break
 	}
-	ui.Column(c).Size(size, size).Shrink(0).Radius(8).Background(a.theme.Surface).Center().Children(func() {
+	ui.Column(c).Label(label).Size(size, size).Shrink(0).Radius(8).Background(a.theme.Surface).Center().Children(func() {
 		ui.Text(c, initial).FontSize(size / 2).Bold().TextColor(highlight)
 	})
 }
@@ -149,15 +150,15 @@ func (a *app) downloadView(c *ui.Context) {
 		return
 	}
 	state := a.resourceSearches[a.kind()]
-	if !state.loaded && !state.failed && !a.busy(catalogJob) {
+	if (state.pending || !state.loaded && !state.failed) && !a.busy(catalogJob) {
 		a.search(0)
 	}
 	busy := a.busy(catalogJob)
 	panel(c).Children(func() {
 		ui.Row(c).Gap(8).Children(func() {
-			input := ui.TextInput(c, &state.query).Key(a.kind()).Label("搜索" + a.resourceKind).
-				Placeholder("搜索" + a.resourceKind + "，支持拼音").Grow(1).Disabled(busy)
-			if ui.PrimaryButton(c, "搜索").Width(72).Disabled(busy).Clicked() || input.Submitted() {
+			input := ui.TextInput(c, &state.query).Label("搜索" + a.resourceKind).
+				Placeholder("搜索" + a.resourceKind).Grow(1)
+			if ui.PrimaryButton(c, "搜索").Width(72).Clicked() || input.Submitted() {
 				a.submitResourceSearch(state)
 			}
 		})
@@ -220,32 +221,24 @@ func (a *app) downloadView(c *ui.Context) {
 }
 
 func (a *app) resourceRow(c *ui.Context, project engine.Project, busy bool) {
-	name := bilingualName(project.Title, project.Slug)
-	row := ui.ButtonBase(c).Key(project.ID).Label(name).Disabled(busy).AlignItems(ui.Stretch).Padding(6, 9).Radius(7)
+	name := a.bilingualName(project.Title, project.Slug)
+	row := ui.ButtonBase(c).Key(project.ID).Label(name).Disabled(busy).
+		Justify(ui.Start).AlignItems(ui.Center).Padding(6, 9).Gap(11).Radius(7)
 	if row.Hovered() {
 		row.Background(a.theme.SurfaceHover)
 	}
 	row.Children(func() {
-		ui.Row(c).Gap(11).Children(func() {
-			a.projectIcon(c, project, 54)
-			ui.Column(c).Grow(1).Gap(3).Children(func() {
-				if chinese := projectChineseName(project.Slug); chinese != "" && chinese != project.Title {
-					ui.Row(c).Gap(6).Children(func() {
-						ui.Text(c, chinese).Bold().MaxLines(1)
-						ui.Text(c, "| "+project.Title).Grow(1).MaxLines(1).TextColor(a.theme.TextMuted).Tooltip(name)
-					})
-				} else {
-					ui.Text(c, name).MaxLines(1).Bold().Tooltip(name)
-				}
-				description := project.Description
-				if tags := project.DisplayCategories; len(tags) > 0 {
-					description = strings.Join(tags[:min(3, len(tags))], " · ") + "  " + description
-				}
-				ui.Text(c, description).MaxLines(1).FontSize(13).TextColor(a.theme.TextMuted).Tooltip(project.Description)
-				if details := a.resourceSummary(project); details != "" {
-					ui.Text(c, details).MaxLines(1).FontSize(12).TextColor(a.theme.TextMuted)
-				}
-			})
+		a.projectIcon(c, project, 54)
+		ui.Column(c).Grow(1).MinWidth(0).Gap(3).Children(func() {
+			ui.Text(c, name).MaxLines(1).Bold().Tooltip(name)
+			description := project.Description
+			if tags := project.DisplayCategories; len(tags) > 0 {
+				description = strings.Join(tags[:min(3, len(tags))], " · ") + "  " + description
+			}
+			ui.Text(c, description).MaxLines(1).FontSize(13).TextColor(a.theme.TextMuted).Tooltip(project.Description)
+			if details := a.resourceSummary(project); details != "" {
+				ui.Text(c, details).MaxLines(1).FontSize(12).TextColor(a.theme.TextMuted)
+			}
 		})
 	})
 	if row.Clicked() {
@@ -265,8 +258,19 @@ func (a *app) resourceSummary(project engine.Project) string {
 		info = append(info, strings.Join(loaders, " / "))
 	}
 	if len(project.Versions) > 0 {
-		versions := slices.Clone(project.Versions[max(0, len(project.Versions)-3):])
-		slices.Reverse(versions)
+		var versions []string
+		for _, game := range a.versionList {
+			if game.Type == "release" && slices.Contains(project.Versions, game.ID) {
+				versions = append(versions, game.ID)
+				if len(versions) == 3 {
+					break
+				}
+			}
+		}
+		if len(versions) == 0 {
+			versions = slices.Clone(project.Versions[max(0, len(project.Versions)-3):])
+			slices.Reverse(versions)
+		}
 		info = append(info, strings.Join(versions, ", "))
 	}
 	if project.Downloads > 0 {
@@ -295,7 +299,7 @@ func (a *app) resourceDetails(c *ui.Context) {
 		ui.Row(c).Gap(12).Children(func() {
 			a.projectIcon(c, a.project, 56)
 			ui.Column(c).Grow(1).Gap(5).Children(func() {
-				ui.Text(c, bilingualName(a.project.Title, a.project.Slug)).FontSize(21).Bold()
+				ui.Text(c, a.bilingualName(a.project.Title, a.project.Slug)).FontSize(21).Bold()
 				ui.Text(c, a.project.Description).TextColor(a.theme.TextMuted)
 			})
 		})
@@ -353,14 +357,24 @@ func (a *app) resourceDetails(c *ui.Context) {
 				for _, file := range group.files {
 					ui.Divider(c)
 					ui.Row(c).Key(file.ID).Gap(8).Children(func() {
+						destination := a.fileDestination(kind, group.key, file, target)
 						ui.Column(c).Grow(1).Gap(3).Children(func() {
 							ui.Text(c, file.Name).Bold().MaxLines(1).Tooltip(file.Name)
-							ui.Text(c, file.VersionNumber+" · "+versionTypeName(file.VersionType)).FontSize(12).TextColor(a.theme.TextMuted)
+							details := file.VersionNumber + " · " + versionTypeName(file.VersionType)
+							if destination.ID != "" && destination.ID != target.ID {
+								details += " · 安装到 " + destination.Name
+							}
+							ui.Text(c, details).FontSize(12).TextColor(a.theme.TextMuted)
 						})
-						compatible := kind == "modpack" || (target.Version == group.key.game &&
-							(kind == "shader" || target.Loader == group.key.loader) && resourceMatches(kind, target, file) && !a.inUse(target))
-						if ui.Button(c, "安装").Label("安装 " + file.Name).Disabled(!compatible || a.busy(downloadJob)).Clicked() {
-							a.installResource(file, target)
+						hint := "需要对应版本和加载器的空闲实例"
+						if kind == "modpack" {
+							hint = "下载并创建新实例"
+						} else if destination.ID != "" {
+							hint = "安装到 " + destination.Name
+						}
+						if ui.Button(c, "安装").Label("安装 " + file.Name).Tooltip(hint).
+							Disabled(kind != "modpack" && destination.ID == "" || a.busy(downloadJob)).Clicked() {
+							a.installResource(file, destination)
 						}
 					})
 				}
@@ -370,6 +384,25 @@ func (a *app) resourceDetails(c *ui.Context) {
 	if !matched {
 		panel(c).Children(func() { ui.Text(c, "没有符合筛选条件的文件。").TextColor(a.theme.TextMuted) })
 	}
+}
+
+func (a *app) fileDestination(kind string, group loaderKey, file engine.ResourceVersion, preferred engine.Instance) engine.Instance {
+	matches := func(i engine.Instance) bool {
+		return i.Version == group.game && (kind == "shader" || i.Loader == group.loader) &&
+			resourceMatches(kind, i, file) && !a.inUse(i)
+	}
+	if matches(preferred) {
+		return preferred
+	}
+	for _, i := range a.instances {
+		if matches(i) {
+			return i
+		}
+	}
+	if resourceMatches(kind, preferred, file) && !a.inUse(preferred) {
+		return preferred
+	}
+	return engine.Instance{}
 }
 
 func (a *app) resourceDestination(c *ui.Context, kind string) engine.Instance {

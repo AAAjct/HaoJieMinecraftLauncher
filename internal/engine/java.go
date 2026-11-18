@@ -1,27 +1,23 @@
 package engine
 
 import (
+	"archive/zip"
 	"context"
-	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
+	"time"
 )
 
 const (
 	azulAPI = "https://api.azul.com/metadata/v1/zulu/packages/"
 )
-
-//go:embed bin/hjml-runtime.exe
-var runtimeHelper []byte
 
 var packageID = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
@@ -100,20 +96,17 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	}
 	defer os.RemoveAll(stage)
 
-	archive, err := download(ctx, build.URL, stage, 512<<20, label, status)
-	if err != nil {
+	archive := filepath.Join(stage, "jdk.zip")
+	item := transfer{artifact{URL: build.URL, SHA256: build.Hash}, archive}
+	progress := &downloadProgress{label: label, status: status, start: time.Now()}
+	status("正在下载 " + label + "…")
+	if err := item.ensureWithProgress(ctx, progress.add); err != nil {
 		return "", err
 	}
-	status("正在校验并解压 " + label + "…")
-	helper := filepath.Join(stage, "hjml-runtime.exe")
-	if err := os.WriteFile(helper, runtimeHelper, 0700); err != nil {
-		return "", err
-	}
+	status("正在解压 " + label + "…")
 	unpacked := filepath.Join(stage, "extracted")
-	cmd := exec.CommandContext(ctx, helper, archive, build.Hash, unpacked)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("%s 解压失败：%w %s", label, err, strings.TrimSpace(string(output)))
+	if err := extractJDK(ctx, archive, unpacked); err != nil {
+		return "", fmt.Errorf("%s 解压失败：%w", label, err)
 	}
 	folders, err := os.ReadDir(unpacked)
 	if err != nil {
@@ -126,4 +119,33 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 		return "", err
 	}
 	return target, nil
+}
+
+func extractJDK(ctx context.Context, archive, destination string) error {
+	z, err := zip.OpenReader(archive)
+	if err != nil {
+		return err
+	}
+	defer z.Close()
+	seen := make(map[string]bool, len(z.File))
+	for _, entry := range z.File {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		target, err := localPath(destination, strings.TrimSuffix(entry.Name, "/"))
+		key := strings.ToLower(target)
+		if err != nil || seen[key] {
+			return fmt.Errorf("无效或重复的 Java 压缩条目 %q", entry.Name)
+		}
+		seen[key] = true
+		if entry.Mode().IsDir() {
+			err = os.MkdirAll(target, 0700)
+		} else {
+			err = writeZipEntry(entry, target)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
 }

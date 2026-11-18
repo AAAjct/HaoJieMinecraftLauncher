@@ -1,50 +1,41 @@
-# HaoJieMinecraftLauncher（HJML）
+# HaoJieMinecraftLauncher
 
-面向 Windows x64 的 Minecraft Java 版启动器。可以安装原版游戏和模组加载器、浏览 Modrinth 资源，并为不同的玩法管理独立实例。界面使用 Go 和 MyGo，Rust 辅助工具随启动器一起构建并嵌入 EXE。
+HJML 是使用 Go 和 MyGo 开发的 Windows x64 Minecraft Java 版启动器。它提供离线玩家启动、独立实例、游戏与加载器安装，以及 Modrinth 模组、整合包和光影下载。
 
-## 快速开始
+## 下载和使用
 
-1. 按下方步骤构建，运行 `dist/windows-amd64/HaoJieMinecraftLauncher.exe`。建议把 EXE 放在有写入权限的目录中，启动器会在旁边创建 `.minecraft`。
-2. 在 **下载 → 游戏版本** 中选择 Minecraft 版本。可以直接安装原版，或展开 Forge、Fabric、Quilt 并选择加载器版本。
-3. 安装完成后返回 **启动**，选择实例并启动游戏。在头像下方可以编辑离线玩家名。
+1. 从 [GitHub Releases](https://github.com/AAAjct/HaoJieMinecraftLauncher/releases/tag/1.0.0) 下载 `HaoJieMinecraftLauncher.exe`，放到有写入权限的目录后双击运行。
+2. 在 **下载 → 游戏版本** 中安装原版，或选择 Fabric、Quilt、Forge。Forge 支持采用现代安装格式的版本。启动器会自动安装所需的 Azul Zulu JDK。
+3. 返回 **启动**，填写离线玩家名并选择实例。首次安装需要联网，文件下载齐全后可离线启动。
 
-首次安装需要联网下载游戏文件和 Java。所需文件齐全后，可以离线启动。当前仅支持离线玩家。
+## 实例和资源
 
-## 游戏与资源管理
+- 点击 **实例管理** 刷新实例和模组列表。选中实例后，可直接编辑并保存名称、打开目录、安装本地文件，或删除实例。删除实例需要确认，单个模组点击 **删除** 后立即移除。
+- 支持拖入 JAR 模组和 Modrinth 整合包，也可通过 **从文件安装** 选择文件。禁用的模组显示为灰色删除线，仍可随时启用。
+- 模组支持按游戏版本和加载器筛选。选择文件后，只有游戏版本与加载器兼容且空闲的实例才能接收安装。若文件对应另一个可用实例，文件行会标明安装目标。
+- 中文模组检索参考 [PCL Community 的中文搜索逻辑](https://github.com/PCL-Community/PCL-CE/pull/3278)，使用其 [MCMOD 名称索引](https://github.com/PCL-Community/PCL-CE/blob/676a752d304165e8c5fd3729841f1582bbf4b795/Plain%20Craft%20Launcher%202/Resources/mcmod.buf) 匹配中文名，再用最佳匹配的项目关键词查询 Modrinth。首次联网获取索引后会在本地缓存。
+- 在 **任务** 查看下载进度、速度和待处理文件。客户端、运行库和游戏资源共用并行队列，支持分段的较大文件会并行下载。
 
-| 功能 | 用法 |
+## 文件位置
+
+| 路径 | 内容 |
 | --- | --- |
-| 游戏版本 | 分别浏览正式版、预览版和远古版。新建 Fabric 实例会默认安装 Fabric API。Forge 支持采用现代安装格式的版本。 |
-| Modrinth | 在 **下载** 页浏览模组、整合包和光影，按游戏版本和适用的加载器筛选文件。安装模组时会检查实例兼容性并解析必需依赖。 |
-| 本地导入 | 把模组 `.jar` 拖入窗口，再选择目标实例。拖入 `.mrpack` 或含 Modrinth 格式清单的 ZIP，可以创建新实例。也可以使用 **从文件安装**。 |
-| 下载任务 | 在 **任务** 页查看阶段、速率和剩余文件。最多并行下载 32 个文件，支持 Range 的大文件可分四段下载。 |
-| Java 与启动 | 按游戏版本自动下载对应的 Azul Zulu Java，并自动分配内存。可同时运行多个实例。用窗口右上角的关闭按钮退出时，会结束本次启动器会话启动的游戏。 |
+| EXE 同级的 `.minecraft/` | 共享游戏资源、中文模组索引和 `versions/<实例目录>/` 中的独立游戏数据 |
+| `%LOCALAPPDATA%\HJML` | 启动器设置、Java、版本目录缓存，以及旧版实例 |
+| 实例目录的 `hjml-latest.log` | 最近一次游戏启动的日志 |
 
-## 数据位置
+## 构建和测试
 
-- **EXE 同级的 `.minecraft/`** 保存共享的 `assets/` 和 `libraries/`。各实例位于 `versions/<实例目录>/`，包含各自的模组、存档、资源包和光影。排查启动问题时，可查看实例目录中的 `hjml-latest.log`。
-- **`%LOCALAPPDATA%\HJML`** 保存启动器设置、Java 和目录缓存。旧版 HJML 实例仍可从原位置使用。
-
-## 从源码构建
-
-在 Windows x64 上准备 PowerShell、Go 1.27.4、Rust MSVC 工具链和 Visual Studio C++ Build Tools。然后在项目根目录运行：
-
-```powershell
-rustup target add x86_64-pc-windows-msvc
-.\build.ps1
-```
-
-构建脚本先生成并嵌入 Rust 辅助工具，再通过 MyGo 打包启动器。默认输出为 `dist/windows-amd64/HaoJieMinecraftLauncher.exe`。
-
-## 运行测试
-
-先完成构建，再运行默认测试：
+在 Windows x64 上安装 Go 1.27.4，然后从仓库根目录运行：
 
 ```powershell
 go test ./...
+.\build.ps1
 ```
 
-联网集成测试会下载并启动 Minecraft 1.21.1，也会验证版本目录、Fabric API 和 Modrinth 下载。游戏启动测试默认使用 Fabric。如需验证 Forge，在运行测试前设置 `$env:HJML_TEST_LOADER = 'forge'`。
+MyGo 构建产物为 `dist/windows-amd64/HaoJieMinecraftLauncher.exe`，Windows 图标嵌入 EXE。根目录的 Go 文件负责界面与交互，`internal/engine/` 负责游戏、Java 和资源管理，`resources/` 保存头像和 HJ 图标。
+
+联网集成测试可以验证真实的游戏目录、模组下载和 Minecraft 启动。默认使用 Fabric，设定 `HJML_TEST_LOADER=forge` 可测试 Forge。
 
 ```powershell
 $env:HJML_INTEGRATION = '1'

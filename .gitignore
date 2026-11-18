@@ -1,4 +1,3 @@
 /dist/
 /.minecraft/
-/runtime-helper/target/
-/internal/engine/bin/*.exe
+/mygo_windows_*.syso

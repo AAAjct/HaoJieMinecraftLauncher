@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -36,8 +39,116 @@ func TestLongVersionListAndFloatingActions(t *testing.T) {
 	test.Frame()
 	stop, hasStop := test.Find("结束所有 Minecraft 实例")
 	top, hasTop := test.Find("回到顶部")
-	if !hasStop || !hasTop || top.X != stop.X || top.Y <= stop.Y || top.Y > 150 {
-		t.Fatalf("running game and long list should stack both actions at the upper right: %v %v", stop, top)
+	if !hasStop || !hasTop || top.X != stop.X || top.Y >= stop.Y || top.Y < 500 {
+		t.Fatalf("running game and long list should stack both actions at the lower right: %v %v", stop, top)
+	}
+	status, found := test.Find("就绪")
+	middle := status.Y + status.H/2
+	if !found || middle < 656 || middle > 658 {
+		t.Fatalf("status is not vertically centered in the bottom bar: %v", status)
+	}
+}
+
+func TestResourceSearchDraftsAndEnter(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.page, a.resourceKind = downloadsPage, "模组"
+	state := a.resourceSearches["mod"]
+	state.loaded, state.total = true, 25
+	state.results = []engine.Project{
+		{ID: "mouse", Title: "Mouse Tweaks", Slug: "mouse-tweaks"},
+		{ID: "other", Title: "Untranslated Project", Slug: "untranslated-project"},
+	}
+	test := ui.NewTester(a.view, 1020, 675)
+	if !test.HasText("Mouse Tweaks") || !test.HasText("Untranslated Project") ||
+		!test.HasText("下一页") || test.HasText("模组 · Modrinth") || test.HasText("下载安装") {
+		t.Fatalf("unexpected project results: %q", test.Texts())
+	}
+	for _, step := range []struct{ tab, input, text string }{
+		{"模组", "搜索模组", "鼠标手势"},
+		{"整合包", "搜索整合包", "2"},
+		{"光影", "搜索光影", "3"},
+	} {
+		if err := test.Click(step.tab); err != nil {
+			t.Fatal(err)
+		}
+		if err := test.Click(step.input); err != nil {
+			t.Fatal(err)
+		}
+		test.Type(step.text)
+		test.Key(0, ui.KeyEnter)
+		if state := a.resourceSearches[a.kind()]; state.query != step.text || state.submitted != step.text {
+			t.Fatalf("%s search draft or Enter submission was lost: %+v", step.tab, state)
+		}
+	}
+	if err := test.Click("模组"); err != nil {
+		t.Fatal(err)
+	}
+	if a.resourceSearches[a.kind()].query != "鼠标手势" || !matchesSearch("建筑师接口", "jianzhushi") ||
+		!matchesSearch("预览版", "ylb") {
+		t.Fatal("search draft or pinyin matching failed")
+	}
+}
+
+func TestManageRefreshAndRename(t *testing.T) {
+	core := engine.Engine{DataDir: t.TempDir(), GameRoot: t.TempDir()}
+	a := newApp(core)
+	instance := engine.Instance{ID: "fabric-original", Name: "旧世界", Version: "26.3", Loader: "fabric"}
+	folder := core.GameDir(instance)
+	if err := os.MkdirAll(folder, 0700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(folder, "instance.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	test := ui.NewTester(a.view, 1020, 675)
+	if err := test.Click("实例管理"); err != nil {
+		t.Fatal(err)
+	}
+	if !test.HasText("26.3 · Fabric") || !test.HasText("打开模组目录") || test.HasText("刷新实例列表") {
+		t.Fatalf("instance was not reread on navigation: %q", test.Texts())
+	}
+	if err := test.Click("实例名称"); err != nil {
+		t.Fatal(err)
+	}
+	if !test.HasText("保存名称") || test.Focused("保存名称") {
+		t.Fatalf("rename input did not open correctly: %q", test.Texts())
+	}
+	test.Key(ui.Ctrl, ui.KeyA)
+	test.Type("新世界")
+	test.Key(0, ui.KeyEnter)
+	saved, err := core.Instances()
+	if err != nil || len(saved) != 1 || saved[0].ID != instance.ID || saved[0].Name != "新世界" ||
+		!test.HasText("新世界") {
+		t.Fatalf("renaming should persist only the name, got %+v: %v; %q", saved, err, test.Texts())
+	}
+	if err := os.Mkdir(filepath.Join(folder, "mods"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	modPath := filepath.Join(folder, "mods", "example.jar.disabled")
+	if err := os.WriteFile(modPath, []byte("test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := test.Click("实例管理"); err != nil {
+		t.Fatal(err)
+	}
+	if err := test.Click("删除"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(modPath); !os.IsNotExist(err) {
+		t.Fatalf("模组应立即删除: %v", err)
+	}
+	if err := test.Click("删除实例"); err != nil {
+		t.Fatal(err)
+	}
+	if err := test.Click("确认删除实例"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(folder); !os.IsNotExist(err) {
+		t.Fatalf("实例目录应已删除: %v", err)
 	}
 }
 
@@ -72,6 +183,44 @@ func TestResourceDetailsGroupAndFilterFiles(t *testing.T) {
 	}
 }
 
+func TestResourceRowsKeepIconsOnLeft(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.page, a.resourceKind = downloadsPage, "模组"
+	state := a.resourceSearches["mod"]
+	state.loaded = true
+	state.results = []engine.Project{
+		{ID: "short", Title: "Short", Description: "One"},
+		{ID: "long", Title: "Long", Description: "A long description that would otherwise make this row substantially wider than the other project row"},
+	}
+	test := ui.NewTester(a.view, 830, 565)
+	short, foundShort := test.Find("Short 图标")
+	long, foundLong := test.Find("Long 图标")
+	if !foundShort || !foundLong || short.X != long.X || short.W != 54 || long.W != 54 {
+		t.Fatalf("icons must have a common left edge and width: %v %v", short, long)
+	}
+}
+
+func TestInstallTargetsMatchFileGroup(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	fabric := engine.Instance{ID: "fabric", Version: "1.21.1", Loader: "fabric"}
+	forge := engine.Instance{ID: "forge", Version: "1.20.1", Loader: "forge"}
+	a.instances = []engine.Instance{fabric, forge}
+	file := engine.ResourceVersion{GameVersions: []string{forge.Version}, Loaders: []string{forge.Loader}}
+	group := loaderKey{forge.Version, forge.Loader}
+	if dest := a.fileDestination("mod", group, file, fabric); dest.ID != forge.ID {
+		t.Fatalf("compatible Forge file should be installable from a Fabric selection: %+v", dest)
+	}
+	a.running[forge.ID] = &engine.Game{}
+	if dest := a.fileDestination("mod", group, file, fabric); dest.ID != "" {
+		t.Fatalf("should not install into a running instance: %+v", dest)
+	}
+	file.GameVersions = append(file.GameVersions, fabric.Version)
+	file.Loaders = append(file.Loaders, fabric.Loader)
+	if dest := a.fileDestination("mod", group, file, fabric); dest.ID != fabric.ID {
+		t.Fatalf("a shared file should still install into the compatible selection: %+v", dest)
+	}
+}
+
 func TestMainNavigation(t *testing.T) {
 	a := newApp(engine.Engine{DataDir: t.TempDir()})
 	a.versionList = []engine.Version{{ID: "1.21.1", Type: "release"}}
@@ -82,7 +231,7 @@ func TestMainNavigation(t *testing.T) {
 	}
 	for _, step := range []struct{ button, text string }{
 		{"下载", "Minecraft 版本"},
-		{"实例管理", "安装实例后可管理模组和查看日志。"},
+		{"实例管理", "安装实例后可在此管理模组。"},
 		{"任务", "任务管理"},
 		{"启动", "离线玩家"},
 	} {

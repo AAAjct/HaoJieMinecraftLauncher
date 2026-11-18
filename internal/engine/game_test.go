@@ -2,10 +2,33 @@ package engine
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestDefaultChineseOptions(t *testing.T) {
+	game := t.TempDir()
+	indexPath, options := filepath.Join(game, "index.json"), filepath.Join(game, "options.txt")
+	for _, tc := range []struct{ asset, before, want string }{
+		{"minecraft/lang/zh_cn.json", "", "lang:zh_cn\n"},
+		{"lang/zh_CN.lang", "renderDistance:8\r\nlang:en_US\r\nmusic:0\r\n", "renderDistance:8\r\nmusic:0\r\nlang:zh_CN\r\n"},
+	} {
+		if err := os.WriteFile(indexPath, []byte(`{"objects":{"`+tc.asset+`":{}}}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(options, []byte(tc.before), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := defaultChinese(game, indexPath); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := os.ReadFile(options); err != nil || string(got) != tc.want {
+			t.Fatalf("options: %q: %v", got, err)
+		}
+	}
+}
 
 func TestMinecraftLaunch(t *testing.T) {
 	if os.Getenv("HJML_INTEGRATION") != "1" {

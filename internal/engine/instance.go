@@ -73,23 +73,38 @@ func (e Engine) RenameInstance(instance Instance, name string) error {
 	if name == "" || strings.ContainsAny(name, "\r\n\x00") {
 		return fmt.Errorf("请输入有效的实例名称")
 	}
-	if !segment(instance.ID) {
-		return fmt.Errorf("无效的实例")
+	dir, saved, err := e.instanceMetadata(instance)
+	if err != nil {
+		return err
+	}
+	saved.Name = name
+	return writeJSON(filepath.Join(dir, "instance.json"), saved)
+}
+
+func (e Engine) RemoveInstance(instance Instance) error {
+	dir, _, err := e.instanceMetadata(instance)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
+func (e Engine) instanceMetadata(instance Instance) (string, Instance, error) {
+	var saved Instance
+	if !segment(instance.ID) || strings.HasPrefix(instance.ID, ".") {
+		return "", saved, fmt.Errorf("无效的实例")
 	}
 	dir := e.GameDir(instance)
 	if instance.legacy || e.GameRoot == "" {
 		dir = filepath.Dir(dir)
 	}
-	path := filepath.Join(dir, "instance.json")
-	var saved Instance
-	if err := readJSON(path, &saved); err != nil {
-		return err
+	if err := readJSON(filepath.Join(dir, "instance.json"), &saved); err != nil {
+		return "", saved, err
 	}
 	if saved.ID != instance.ID {
-		return fmt.Errorf("实例信息已更改，请刷新后重试")
+		return "", saved, fmt.Errorf("实例信息已更改，请刷新后重试")
 	}
-	saved.Name = name
-	return writeJSON(path, saved)
+	return dir, saved, nil
 }
 
 func (e Engine) Install(ctx context.Context, instance Instance, status func(string)) (Instance, error) {

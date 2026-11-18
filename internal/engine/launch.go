@@ -106,10 +106,11 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureAll(ctx, files, "检查客户端文件", status); err != nil {
+	assetFiles, err := e.assetTransfers(ctx, profile)
+	if err != nil {
 		return nil, err
 	}
-	if err := e.ensureAssets(ctx, profile, status); err != nil {
+	if err := ensureAll(ctx, append(files, assetFiles...), "检查客户端文件和资源", status); err != nil {
 		return nil, err
 	}
 	game := e.GameDir(instance)

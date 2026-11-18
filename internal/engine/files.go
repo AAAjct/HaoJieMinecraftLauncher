@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"hash"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,24 +77,30 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 		return err
 	}
 	var err error
-	for _, source := range append([]string{t.URL}, t.Mirrors...) {
-		t.URL = source
-		for attempt := range 3 {
+	sources := append([]string{t.URL}, t.Mirrors...)
+	for attempt := range 3 {
+		for _, source := range sources {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			err = t.copyWithProgress(ctx, progress)
+			t.URL = source
+			downloadCtx, cancel := ctx, func() {}
+			if len(sources) > 1 && t.Size > 0 && t.Size <= 1<<20 {
+				downloadCtx, cancel = context.WithTimeout(ctx, 8*time.Second)
+			}
+			err = t.copyWithProgress(downloadCtx, progress)
+			cancel()
 			if err == nil {
 				return nil
 			}
-			if attempt < 2 {
-				timer := time.NewTimer(time.Duration(attempt+1) * 300 * time.Millisecond)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return ctx.Err()
-				case <-timer.C:
-				}
+		}
+		if attempt < 2 {
+			timer := time.NewTimer(time.Duration(attempt+1) * 300 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
 			}
 		}
 	}
@@ -141,6 +149,8 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 }
 
 func ensureAll(ctx context.Context, work []transfer, label string, status func(string)) error {
+	work = slices.Clone(work)
+	slices.SortStableFunc(work, func(a, b transfer) int { return cmp.Compare(b.Size, a.Size) })
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	status(fmt.Sprintf("%s · 0/%d", label, len(work)))
