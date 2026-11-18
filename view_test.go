@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -20,9 +21,16 @@ func TestLongVersionListAndFloatingActions(t *testing.T) {
 	}
 	test := ui.NewTester(a.view, 1020, 675)
 	test.Frame()
-	if test.HasText("显示更多正式版") || test.HasText("从文件安装") || test.HasText("资源包") {
+	if test.HasText("显示更多正式版") || test.HasText("从文件安装") {
 		t.Fatalf("old download controls still shown: %q", test.Texts())
 	}
+	if test.HasText("选择 Minecraft 1.21.50") {
+		t.Fatal("release group should be collapsed by default")
+	}
+	if err := test.Click("正式版（50）"); err != nil {
+		t.Fatal(err)
+	}
+	test.Advance(300 * time.Millisecond)
 	a.mainScroll.Y = a.mainScroll.MaxY
 	test.Frame()
 	if !test.HasText("1.21.50") || a.mainScroll.Y == 0 {
@@ -171,6 +179,50 @@ func TestManageRefreshAndRename(t *testing.T) {
 	}
 }
 
+func TestLocalModRowsDisplayMetadata(t *testing.T) {
+	core := engine.Engine{DataDir: t.TempDir()}
+	instance := engine.Instance{ID: "fabric", Name: "测试实例", Loader: "fabric"}
+	dir := filepath.Join(core.GameDir(instance), "mods")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(filepath.Join(dir, "demo-1.2.jar"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jar := zip.NewWriter(file)
+	for name, data := range map[string][]byte{
+		"fabric.mod.json": []byte(`{"id":"demo","name":"Demo Mod","version":"1.2","description":"A useful library.","icon":{"64":"icon.png"},"custom":{"modmenu":{"badges":["library"]}}}`),
+		"icon.png":        stevePNG,
+	} {
+		entry, err := jar.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := jar.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a := newApp(core)
+	a.page, a.instances, a.selected = managePage, []engine.Instance{instance}, instance.ID
+	a.refreshMods()
+	test := ui.NewTester(a.view, 830, 565)
+	icon, hasIcon := test.Find("Demo Mod 图标")
+	title, hasTitle := test.Find("Demo Mod")
+	version, hasVersion := test.Find("|  1.2")
+	details, hasDetails := test.Find("支持库  demo-1.2: A useful library.")
+	if !hasIcon || !hasTitle || !hasVersion || !hasDetails || a.modIcons["demo-1.2.jar"] == nil ||
+		icon.X+icon.W > title.X || title.X >= version.X || title.X != details.X || details.Y <= title.Y {
+		t.Fatalf("unexpected mod row layout: %v %v %v %v", icon, title, version, details)
+	}
+}
+
 func TestResourceDetailsGroupAndFilterFiles(t *testing.T) {
 	a := newApp(engine.Engine{DataDir: t.TempDir()})
 	a.page, a.resourceKind = downloadsPage, "模组"
@@ -179,7 +231,7 @@ func TestResourceDetailsGroupAndFilterFiles(t *testing.T) {
 	a.resourceGroups = groupResourceVersions([]engine.ResourceVersion{
 		{ID: "modern", Name: "Mouse Tweaks Modern", VersionNumber: "2.0", GameVersions: []string{"1.21.1"}, Loaders: []string{"fabric", "forge"}},
 		{ID: "older", Name: "Mouse Tweaks Old", VersionNumber: "1.0", GameVersions: []string{"1.20.1"}, Loaders: []string{"forge"}},
-	}, nil)
+	}, nil, "mod")
 	test := ui.NewTester(a.view, 1020, 675)
 	if test.HasText("Mouse Tweaks Modern") || !test.HasText("Forge 1.20.1（1）") {
 		t.Fatalf("expected collapsed file groups: %q", test.Texts())
@@ -275,7 +327,7 @@ func TestResourceDetailsRecommendsSelectedInstance(t *testing.T) {
 func TestMainNavigation(t *testing.T) {
 	a := newApp(engine.Engine{DataDir: t.TempDir()})
 	a.versionList = []engine.Version{{ID: "1.21.1", Type: "release"}}
-	a.jobs[downloadJob] = &job{message: "下载资源 · 5/10 · 1.4 MiB/s"}
+	a.jobs = []*job{{kind: downloadJob, title: "下载", message: "下载资源 · 5/10 · 1.4 MiB/s"}}
 	test := ui.NewTester(a.view, 1020, 675)
 	if !test.HasText("离线玩家") || test.HasText("HaoJieMinecraftLauncher") || test.HasText("设置") {
 		t.Fatalf("home content: %q", test.Texts())
@@ -292,6 +344,54 @@ func TestMainNavigation(t *testing.T) {
 		if !test.HasText(step.text) {
 			t.Fatalf("%s: missing %q in %q", step.button, step.text, test.Texts())
 		}
+	}
+}
+
+func TestDownloadCategoriesAndLocalImportLayout(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.page = downloadsPage
+	test := ui.NewTester(a.view, 830, 565)
+	test.Frame()
+	for _, entry := range []struct{ name, field string }{
+		{"数据包", "搜索数据包"}, {"资源包", "搜索资源包"}, {"世界", "世界 ZIP 下载链接"},
+	} {
+		if err := test.Click(entry.name); err != nil {
+			t.Fatal(err)
+		}
+		test.Advance(300 * time.Millisecond)
+		if _, ok := test.Find(entry.field); !ok {
+			t.Fatalf("download category %s did not expose %s", entry.name, entry.field)
+		}
+	}
+	before, ok := test.Find("就绪")
+	if !ok {
+		t.Fatal("missing status bar")
+	}
+	a.jobs = []*job{{kind: importJob, title: "从文件安装", message: "正在安装模组"}}
+	test.Frame()
+	after, ok := test.Find("就绪")
+	if !ok || before != after || test.HasText("取消导入") {
+		t.Fatalf("local mod import moved the status bar: %v -> %v", before, after)
+	}
+}
+
+func TestParallelDownloadJobsKeepSeparateTargets(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.jobs = []*job{
+		{kind: downloadJob, key: "mod-one", title: "模组一", target: "fabric", cancel: func() {}},
+		{kind: downloadJob, key: "mod-two", title: "模组二", target: "fabric", cancel: func() {}},
+	}
+	if a.downloadCount() != 2 || !a.downloading("mod-one", "fabric") || a.downloading("mod-three", "fabric") ||
+		!a.inUse(engine.Instance{ID: "fabric"}) || a.gameInUse(engine.Instance{ID: "fabric"}) {
+		t.Fatal("downloads must block launching and edits without blocking other downloads")
+	}
+	a.page = tasksPage
+	test := ui.NewTester(a.view, 1020, 675)
+	if err := test.Click("取消 模组一"); err != nil {
+		t.Fatal(err)
+	}
+	if !a.jobs[0].cancelling || a.jobs[1].cancelling {
+		t.Fatal("cancelling one download affected another")
 	}
 }
 
@@ -356,7 +456,7 @@ func TestChooseGameAndLoaderBuild(t *testing.T) {
 	a.loaderLists[loaderKey{"1.20.1", "fabric"}] = []engine.LoaderBuild{{Version: "0.18.1", Stable: true}}
 	a.page = downloadsPage
 	test := ui.NewTester(a.view, 1020, 675)
-	for _, label := range []string{"选择 Minecraft 1.20.1", "Forge（2）", "选择 Forge 47.1.0", "Fabric（1）", "选择 Fabric 0.18.1"} {
+	for _, label := range []string{"正式版（2）", "选择 Minecraft 1.20.1", "Forge（2）", "选择 Forge 47.1.0", "Fabric（1）", "选择 Fabric 0.18.1"} {
 		if err := test.Click(label); err != nil {
 			t.Fatalf("%s: %v", label, err)
 		}

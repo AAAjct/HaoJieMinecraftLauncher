@@ -22,7 +22,14 @@ const (
 var packageID = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
 func (e Engine) javaHome(major int) string {
-	return filepath.Join(e.DataDir, "java", fmt.Sprintf("zulu-%d", major))
+	return filepath.Join(e.javaRoot(), fmt.Sprintf("Zulu %d", major))
+}
+
+func (e Engine) javaRoot() string {
+	if e.JavaRoot != "" {
+		return e.JavaRoot
+	}
+	return filepath.Join(e.DataDir, "Jdk")
 }
 
 func isJDK(home string) bool {
@@ -31,10 +38,10 @@ func isJDK(home string) bool {
 }
 
 func (e Engine) InstalledJava() []int {
-	entries, _ := os.ReadDir(filepath.Join(e.DataDir, "java"))
+	entries, _ := os.ReadDir(e.javaRoot())
 	var versions []int
 	for _, entry := range entries {
-		major, found := strings.CutPrefix(entry.Name(), "zulu-")
+		major, found := strings.CutPrefix(entry.Name(), "Zulu ")
 		n, err := strconv.Atoi(major)
 		if found && err == nil && n > 0 && isJDK(e.javaHome(n)) {
 			versions = append(versions, n)
@@ -47,6 +54,21 @@ func (e Engine) InstalledJava() []int {
 func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) (string, error) {
 	ctx = e.resumableDownloads(ctx)
 	target := e.javaHome(major)
+	if isJDK(target) {
+		return target, nil
+	}
+	parent := filepath.Dir(target)
+	if err := os.MkdirAll(parent, 0700); err != nil {
+		return "", err
+	}
+	lock, err := os.OpenFile(filepath.Join(parent, fmt.Sprintf(".zulu-%d.lock", major)), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
+	if err := waitFileLock(ctx, lock); err != nil {
+		return "", err
+	}
 	if isJDK(target) {
 		return target, nil
 	}
@@ -87,10 +109,6 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 		return "", fmt.Errorf("Azul 返回的 %s 下载地址或校验值无效", label)
 	}
 
-	parent := filepath.Dir(target)
-	if err := os.MkdirAll(parent, 0700); err != nil {
-		return "", err
-	}
 	stage, err := os.MkdirTemp(parent, ".install-")
 	if err != nil {
 		return "", err

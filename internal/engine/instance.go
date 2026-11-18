@@ -9,8 +9,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 )
+
+var instancePublishMu sync.Mutex
 
 type Instance struct {
 	ID      string
@@ -24,9 +27,12 @@ type Instance struct {
 }
 
 type Mod struct {
-	Filename string
-	Enabled  bool
-	ID, Name string
+	Filename          string
+	Enabled           bool
+	ID, Name, Version string
+	Description       string
+	Tags              []string
+	Icon              []byte
 }
 
 func (e Engine) Instances() ([]Instance, error) {
@@ -167,6 +173,11 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 			return Instance{}, err
 		}
 	}
+	instancePublishMu.Lock()
+	defer instancePublishMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Instance{}, err
+	}
 	var id [12]byte
 	rand.Read(id[:])
 	idSuffix := hex.EncodeToString(id[:])
@@ -240,10 +251,7 @@ func (e Engine) Mods(instance Instance) ([]Mod, error) {
 		if entry.Type().IsRegular() && (strings.HasSuffix(strings.ToLower(entry.Name()), ".jar") ||
 			strings.HasSuffix(strings.ToLower(entry.Name()), ".jar.disabled")) {
 			mod := Mod{Filename: entry.Name(), Enabled: !strings.HasSuffix(strings.ToLower(entry.Name()), ".disabled")}
-			var meta struct{ ID, Name string }
-			if readModJSON(filepath.Join(e.GameDir(instance), "mods", entry.Name()), &meta) == nil {
-				mod.ID, mod.Name = meta.ID, meta.Name
-			}
+			readModInfo(filepath.Join(e.GameDir(instance), "mods", entry.Name()), instance.Loader, &mod)
 			result = append(result, mod)
 		}
 	}

@@ -1,8 +1,8 @@
 {
-  "name": "HaoJieMinecraftLauncher",
+  "name": "HJML",
   "slug": "hjml",
   "identifier": "com.haojie.hjml",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "icon": "resources/icon.png",
   "out": "dist"
 }

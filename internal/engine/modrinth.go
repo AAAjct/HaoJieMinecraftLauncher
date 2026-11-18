@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,10 +13,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const modrinth = "https://api.modrinth.com/v2/"
+
+var resourcePublishMu sync.Mutex
 
 type Project struct {
 	ID                string `json:"project_id"`
@@ -86,7 +90,7 @@ func Search(ctx context.Context, kind, query string, filter Instance, page int) 
 	if filter.Version != "" {
 		filters = append(filters, []string{"versions:" + filter.Version})
 	}
-	if filter.Loader != "" {
+	if filter.Loader != "" && kind != "datapack" && kind != "resourcepack" {
 		filters = append(filters, []string{"categories:" + filter.Loader})
 	}
 	facets, _ := json.Marshal(filters)
@@ -101,6 +105,9 @@ func Search(ctx context.Context, kind, query string, filter Instance, page int) 
 
 func ResourceVersions(ctx context.Context, id, kind string, instance Instance) ([]ResourceVersion, error) {
 	q := url.Values{"include_changelog": {"false"}}
+	if kind == "datapack" {
+		q.Set("loaders", `["datapack"]`)
+	}
 	if kind == "mod" {
 		for key, value := range map[string]string{"game_versions": instance.Version, "loaders": instance.Loader} {
 			if value != "" {
@@ -203,6 +210,17 @@ func resolveMods(ctx context.Context, instance Instance, root ResourceVersion) (
 }
 
 func (e Engine) InstallResource(ctx context.Context, kind string, instance Instance, version ResourceVersion, status func(string)) error {
+	return e.installResource(ctx, kind, instance, "", version, status)
+}
+
+func (e Engine) InstallDatapack(ctx context.Context, instance Instance, world string, version ResourceVersion, status func(string)) error {
+	if !slices.Contains(version.Loaders, "datapack") || !slices.Contains(version.GameVersions, instance.Version) {
+		return fmt.Errorf("所选数据包与实例版本不兼容")
+	}
+	return e.installResource(ctx, "datapack", instance, world, version, status)
+}
+
+func (e Engine) installResource(ctx context.Context, kind string, instance Instance, world string, version ResourceVersion, status func(string)) error {
 	ctx = e.resumableDownloads(ctx)
 	var files []resourceFile
 	var err error
@@ -215,13 +233,13 @@ func (e Engine) InstallResource(ctx context.Context, kind string, instance Insta
 		status("正在解析必需模组依赖…")
 		files, err = resolveMods(ctx, instance, version)
 		folder = "mods"
-	case "shader", "resourcepack":
+	case "shader", "resourcepack", "datapack":
 		var file resourceFile
 		file, err = version.selectedFile(".zip")
 		files = []resourceFile{file}
-		folder = "shaderpacks"
-		if kind == "resourcepack" {
-			folder = "resourcepacks"
+		folder = kind + "s"
+		if kind == "shader" {
+			folder = "shaderpacks"
 		}
 	default:
 		return fmt.Errorf("无效资源类型")
@@ -231,41 +249,115 @@ func (e Engine) InstallResource(ctx context.Context, kind string, instance Insta
 	}
 
 	game := e.GameDir(instance)
+	if kind == "datapack" {
+		worlds, err := e.Worlds(instance)
+		if err != nil {
+			return err
+		}
+		if !slices.Contains(worlds, world) {
+			return fmt.Errorf("目标存档不存在")
+		}
+		folder = filepath.Join("saves", world, "datapacks")
+	}
 	stage, err := os.MkdirTemp(game, ".download-")
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(stage)
 	targetDir := filepath.Join(game, folder)
+	work, err := resourceDownloadWork(files, stage, targetDir, kind == "mod")
+	if err != nil {
+		return err
+	}
+	if err := ensureAll(ctx, work, "下载资源", status); err != nil {
+		return err
+	}
+	resourcePublishMu.Lock()
+	defer resourcePublishMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if kind == "datapack" && !regularFile(filepath.Join(filepath.Dir(targetDir), "level.dat")) {
+		return fmt.Errorf("目标存档不存在")
+	}
+	return publishResources(work, targetDir, kind == "mod")
+}
+
+func resourceDownloadWork(files []resourceFile, stage, targetDir string, mod bool) ([]transfer, error) {
+	resourcePublishMu.Lock()
+	defer resourcePublishMu.Unlock()
 	var work []transfer
 	names := map[string]bool{}
 	for _, file := range files {
 		key := strings.ToLower(file.Filename)
 		if names[key] {
-			return fmt.Errorf("依赖包含同名文件 %s", file.Filename)
+			return nil, fmt.Errorf("依赖包含同名文件 %s", file.Filename)
 		}
 		names[key] = true
-		active := file.transfer(targetDir)
-		disabled := active
-		disabled.target += ".disabled"
-		if active.ready() || (kind == "mod" && disabled.ready()) {
+		found, err := installedResource(file.transfer(targetDir), mod)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			work = append(work, file.transfer(stage))
+		}
+	}
+	return work, nil
+}
+
+func installedResource(item transfer, mod bool) (bool, error) {
+	name := filepath.Base(item.target)
+	paths := []string{item.target}
+	if mod {
+		paths = append(paths, item.target+".disabled")
+	}
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
 			continue
 		}
-		if regularFile(active.target) {
-			return fmt.Errorf("%s 已存在，请先处理该文件", file.Filename)
+		if err != nil {
+			return false, err
 		}
-		work = append(work, file.transfer(stage))
+		if info.Mode().IsRegular() && (item.Size <= 0 || info.Size() == item.Size) {
+			file, err := os.Open(path)
+			if err != nil {
+				return false, err
+			}
+			digest, expected := item.digest()
+			_, err = io.Copy(digest, file)
+			file.Close()
+			if err != nil {
+				return false, err
+			}
+			if strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), expected) {
+				return true, nil
+			}
+		}
+		return false, fmt.Errorf("%s 已存在，请先处理该文件", name)
 	}
-	if err := ensureAll(ctx, work, "下载资源", status); err != nil {
-		return err
-	}
+	return false, nil
+}
+
+func publishResources(work []transfer, targetDir string, mod bool) error {
 	if err := os.MkdirAll(targetDir, 0700); err != nil {
 		return err
 	}
-	var added []string
+	var toPublish []transfer
 	for _, item := range work {
+		target := transfer{item.artifact, filepath.Join(targetDir, filepath.Base(item.target))}
+		found, err := installedResource(target, mod)
+		if err != nil {
+			return err
+		}
+		if !found {
+			toPublish = append(toPublish, item)
+		}
+	}
+	var added []string
+	for _, item := range toPublish {
 		target := filepath.Join(targetDir, filepath.Base(item.target))
-		if err := os.Rename(item.target, target); err != nil {
+		if err := os.Link(item.target, target); err != nil {
 			for _, path := range added {
 				_ = os.Remove(path)
 			}

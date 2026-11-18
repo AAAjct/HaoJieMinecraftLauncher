@@ -34,6 +34,7 @@ type app struct {
 	instances     []engine.Instance
 	selected      string
 	mods          []engine.Mod
+	modIcons      map[string]ui.ImageSource
 	deleteConfirm bool
 	modFilter     string
 	renameValue   string
@@ -62,16 +63,18 @@ type app struct {
 	resourceGroups                             []resourceGroup
 	openResourceGroups                         map[loaderKey]bool
 	fileGame, fileLoader, resourceTarget       string
+	worldURL, datapackWorld, datapackInstance  string
+	datapackWorlds                             []string
 	resourceLoaders                            []engine.ResourceLoader
 	projectIcons                               map[string]ui.ImageSource
 	mainScroll, instanceScroll                 ui.ScrollState
 
-	status                       string
-	jobs                         map[jobKind]*job
-	closing                      bool
-	downloadTarget, launchTarget string
-	importConfirm                bool
-	pendingImport                importRequest
+	status        string
+	jobs          []*job
+	closing       bool
+	launchTarget  string
+	importConfirm bool
+	pendingImport importRequest
 }
 
 type operation func(context.Context, func(string)) (func(), error)
@@ -82,19 +85,60 @@ const (
 	downloadJob jobKind = "下载"
 	catalogJob  jobKind = "检索"
 	launchJob   jobKind = "启动"
+	importJob   jobKind = "导入"
 )
 
 type job struct {
+	kind       jobKind
+	key, title string
+	target     string
 	message    string
 	cancel     context.CancelFunc
 	cancelling bool
 	superseded bool
 }
 
-func (a *app) busy(kind jobKind) bool { return a.jobs[kind] != nil }
+func (task *job) requestCancel() {
+	task.cancelling = true
+	task.message = "正在取消并清理临时文件…"
+	task.cancel()
+}
+
+func (a *app) downloadCount() int {
+	count := 0
+	for _, task := range a.jobs {
+		if task.kind == downloadJob {
+			count++
+		}
+	}
+	return count
+}
+
+func (a *app) activeJob(kind jobKind) *job {
+	for _, task := range a.jobs {
+		if task.kind == kind {
+			return task
+		}
+	}
+	return nil
+}
+
+func (a *app) busy(kind jobKind) bool { return a.activeJob(kind) != nil }
+
+func (a *app) downloading(key, target string) bool {
+	return slices.ContainsFunc(a.jobs, func(task *job) bool {
+		return task.kind == downloadJob && task.key == key && task.target == target
+	})
+}
+
+func (a *app) gameInUse(i engine.Instance) bool {
+	return i.ID != "" && (a.running[i.ID] != nil || a.launchTarget == i.ID)
+}
 
 func (a *app) inUse(i engine.Instance) bool {
-	return i.ID != "" && (a.running[i.ID] != nil || a.launchTarget == i.ID || a.downloadTarget == i.ID)
+	return i.ID != "" && (a.gameInUse(i) || slices.ContainsFunc(a.jobs, func(task *job) bool {
+		return task.target == i.ID
+	}))
 }
 
 func (a *app) navigate(page string) {
@@ -133,12 +177,12 @@ func newApp(core engine.Engine) *app {
 		engine: core, theme: theme, page: launchPage, settings: s,
 		nickname: s.Nickname, selected: s.Instance,
 		running: map[string]*engine.Game{}, resourceKind: "游戏版本",
-		status: "就绪", jobs: map[jobKind]*job{},
-		versionGroups: map[string]bool{"release": true},
+		status:        "就绪",
+		versionGroups: map[string]bool{},
 		openLoaders:   map[string]bool{}, loaderLists: map[loaderKey][]engine.LoaderBuild{},
 		buildStamps: map[loaderKey]time.Time{}, buildLoading: map[loaderKey]bool{}, buildErrors: map[loaderKey]string{},
 		projectIcons: map[string]ui.ImageSource{}, openResourceGroups: map[loaderKey]bool{},
-		resourceSearches: map[string]*resourceSearch{"mod": {}, "modpack": {}, "shader": {}},
+		resourceSearches: map[string]*resourceSearch{"mod": {}, "modpack": {}, "shader": {}, "datapack": {}, "resourcepack": {}},
 	}
 	a.versionList, a.versionStamp = core.CachedVersions()
 	a.refreshInstances()
@@ -172,11 +216,22 @@ func (a *app) refreshInstances() {
 
 func (a *app) refreshMods() {
 	a.mods = nil
+	a.modIcons = nil
 	if i := a.current(); i.ID != "" {
 		var err error
 		a.mods, err = a.engine.Mods(i)
 		if err != nil {
 			a.status = err.Error()
+		}
+		a.modIcons = make(map[string]ui.ImageSource)
+		for index, mod := range a.mods {
+			if len(mod.Icon) == 0 {
+				continue
+			}
+			if icon, err := ui.DecodeBitmapScaled(mod.Icon, 88); err == nil {
+				a.modIcons[mod.Filename] = icon
+			}
+			a.mods[index].Icon = nil
 		}
 	}
 }
@@ -206,23 +261,36 @@ func (a *app) installed(i engine.Instance) {
 }
 
 func (a *app) start(kind jobKind, message string, work operation) {
-	if a.busy(kind) || a.closing {
+	if !a.busy(kind) {
+		a.startJob(&job{kind: kind, title: string(kind), message: message}, work)
+	}
+}
+
+func (a *app) startDownload(key, title, target, message string, work operation) {
+	if key == "" || !a.downloading(key, target) {
+		a.startJob(&job{kind: downloadJob, key: key, title: title, target: target, message: message}, work)
+	}
+}
+
+func (a *app) startJob(task *job, work operation) {
+	if a.closing || a.window == nil {
 		return
 	}
+	kind := task.kind
 	ctx, cancel := context.WithCancel(context.Background())
-	task := &job{message: message, cancel: cancel}
-	a.jobs[kind] = task
+	task.cancel = cancel
+	a.jobs = append(a.jobs, task)
 	go func() {
 		defer cancel()
 		finish, err := work(ctx, func(s string) {
 			a.window.Update(func() {
-				if a.jobs[kind] == task && !task.cancelling {
+				if !task.cancelling && slices.Contains(a.jobs, task) {
 					task.message = s
 				}
 			})
 		})
 		a.window.Update(func() {
-			delete(a.jobs, kind)
+			a.jobs = slices.DeleteFunc(a.jobs, func(active *job) bool { return active == task })
 			switch kind {
 			case catalogJob:
 				if a.activeSearch != nil {
@@ -231,8 +299,6 @@ func (a *app) start(kind jobKind, message string, work operation) {
 					}
 					a.activeSearch = nil
 				}
-			case downloadJob:
-				a.downloadTarget = ""
 			case launchJob:
 				a.launchTarget = ""
 			}
@@ -249,7 +315,7 @@ func (a *app) start(kind jobKind, message string, work operation) {
 				return
 			}
 			if err != nil {
-				if kind == downloadJob {
+				if kind == downloadJob || kind == importJob {
 					a.refreshInstances()
 				}
 				a.status = err.Error()
@@ -265,10 +331,18 @@ func (a *app) start(kind jobKind, message string, work operation) {
 
 func (a *app) install() {
 	i := a.installSelection()
-	a.start(downloadJob, "正在准备安装 Minecraft…", func(ctx context.Context, status func(string)) (func(), error) {
+	title := strings.TrimSpace(i.Name)
+	if title == "" {
+		title = "Minecraft " + i.Version + " · " + loaderName(i)
+	}
+	a.startDownload(versionDownloadKey(i), title, "", "正在准备安装 Minecraft…", func(ctx context.Context, status func(string)) (func(), error) {
 		i, err := a.engine.Install(ctx, i, status)
 		return func() { a.installed(i) }, err
 	})
+}
+
+func versionDownloadKey(i engine.Instance) string {
+	return strings.Join([]string{"game", i.Version, i.Loader, i.Build, strings.TrimSpace(i.Name)}, "\x00")
 }
 
 func (a *app) play(i engine.Instance) {
@@ -321,7 +395,7 @@ func (a *app) play(i engine.Instance) {
 }
 
 func (a *app) stopGames() {
-	if task := a.jobs[launchJob]; task != nil {
+	if task := a.activeJob(launchJob); task != nil {
 		a.stopLaunch = true
 		task.cancelling = true
 		task.message = "正在取消启动…"
@@ -345,6 +419,12 @@ func (a *app) kind() string {
 		return "modpack"
 	case "光影":
 		return "shader"
+	case "数据包":
+		return "datapack"
+	case "资源包":
+		return "resourcepack"
+	case "世界":
+		return "world"
 	default:
 		return ""
 	}
@@ -434,7 +514,7 @@ func (a *app) submitResourceSearch(state *resourceSearch) {
 	if a.activeSearch == state && state.submitted == query {
 		return
 	}
-	if task := a.jobs[catalogJob]; a.activeSearch != nil && task != nil && !task.cancelling {
+	if task := a.activeJob(catalogJob); a.activeSearch != nil && task != nil && !task.cancelling {
 		task.superseded = true
 		task.cancel()
 	}
@@ -446,16 +526,18 @@ func (a *app) submitResourceSearch(state *resourceSearch) {
 
 func (a *app) loadProject(p engine.Project) {
 	kind := a.kind()
+	cacheKey := kind + ":" + p.ID
 	state := a.resourceSearches[kind]
 	show := func(list []engine.ResourceVersion) {
-		a.project, a.resourceGroups = p, groupResourceVersions(list, a.versionList)
+		a.project, a.resourceGroups = p, groupResourceVersions(list, a.versionList, kind)
 		a.fileGame, a.fileLoader = state.game, state.loader
 		a.resourceTarget = a.selected
+		a.datapackInstance = ""
 		clear(a.openResourceGroups)
 		a.mainScroll.Y = 0
 		a.status = "项目版本已加载。"
 	}
-	if cached, ok := a.projectVersions[p.ID]; ok && time.Since(cached.at) < 5*time.Minute {
+	if cached, ok := a.projectVersions[cacheKey]; ok && time.Since(cached.at) < 5*time.Minute {
 		show(cached.versions)
 		return
 	}
@@ -467,7 +549,7 @@ func (a *app) loadProject(p engine.Project) {
 			if a.projectVersions == nil || len(a.projectVersions) >= 24 {
 				a.projectVersions = make(map[string]projectVersionResult)
 			}
-			a.projectVersions[p.ID] = projectVersionResult{list, time.Now()}
+			a.projectVersions[cacheKey] = projectVersionResult{list, time.Now()}
 			if a.page != downloadsPage || a.kind() != kind {
 				return
 			}
@@ -483,23 +565,42 @@ type projectVersionResult struct {
 
 func (a *app) installResource(v engine.ResourceVersion, i engine.Instance) {
 	kind := a.kind()
-	if a.busy(downloadJob) || (kind != "modpack" && (a.inUse(i) || !resourceMatches(kind, i, v))) {
+	world := ""
+	if kind == "datapack" {
+		world = a.datapackWorld
+	}
+	if kind != "modpack" && (a.gameInUse(i) || !resourceMatches(kind, i, v)) {
 		return
 	}
-	if kind != "modpack" {
-		a.downloadTarget = i.ID
+	if kind == "datapack" && (world == "" || i.ID != a.datapackInstance) {
+		return
 	}
-	a.start(downloadJob, "正在准备下载…", func(ctx context.Context, status func(string)) (func(), error) {
+	title := v.Name
+	if i.ID != "" {
+		title += " · " + i.Name
+	}
+	a.startDownload(resourceDownloadKey(kind, v.ID, world), title, i.ID, "正在准备下载…", func(ctx context.Context, status func(string)) (func(), error) {
 		if kind == "modpack" {
 			pack, err := a.engine.DownloadPack(ctx, v, status)
 			return func() { a.installed(pack) }, err
 		}
-		err := a.engine.InstallResource(ctx, kind, i, v, status)
+		var err error
+		if kind == "datapack" {
+			err = a.engine.InstallDatapack(ctx, i, world, v, status)
+		} else {
+			err = a.engine.InstallResource(ctx, kind, i, v, status)
+		}
 		return func() {
-			a.refreshMods()
+			if kind == "mod" {
+				a.refreshMods()
+			}
 			a.status = "已安装 " + v.Name
 		}, err
 	})
+}
+
+func resourceDownloadKey(kind, id, world string) string {
+	return strings.Join([]string{kind, id, world}, "\x00")
 }
 
 func (a *app) saveNickname() {
@@ -552,8 +653,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	gameRoot := filepath.Join(filepath.Dir(exe), ".minecraft")
-	a := newApp(engine.Engine{DataDir: filepath.Join(data, "HJML"), GameRoot: gameRoot})
+	exeDir := filepath.Dir(exe)
+	gameRoot := filepath.Join(exeDir, ".minecraft")
+	a := newApp(engine.Engine{DataDir: filepath.Join(data, "HJML"), GameRoot: gameRoot, JavaRoot: filepath.Join(exeDir, "Jdk")})
 	catalogCtx, stopCatalog := context.WithCancel(context.Background())
 	defer stopCatalog()
 	a.catalogContext = catalogCtx

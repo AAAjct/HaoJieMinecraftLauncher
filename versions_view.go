@@ -98,7 +98,6 @@ func (a *app) versionsView(c *ui.Context) {
 			if previous != a.versionFilter || input.Submitted() {
 				a.mainScroll.Y = 0
 				clear(a.versionGroups)
-				a.versionGroups["release"] = true
 				if strings.TrimSpace(a.versionFilter) != "" {
 					for _, group := range gameVersionGroups {
 						a.versionGroups[group.key] = true
@@ -281,7 +280,8 @@ func (a *app) installVersionBar(c *ui.Context) {
 		if a.selectedLoader != "" && ui.Button(c, "改用原版").Clicked() {
 			a.selectedLoader, a.selectedBuild = "", ""
 		}
-		if ui.PrimaryButton(c, "开始下载").Width(132).Height(38).Disabled(a.busy(downloadJob)).Clicked() {
+		if ui.PrimaryButton(c, "开始下载").Width(132).Height(38).
+			Disabled(a.downloading(versionDownloadKey(a.installSelection()), "")).Clicked() {
 			a.install()
 		}
 	})

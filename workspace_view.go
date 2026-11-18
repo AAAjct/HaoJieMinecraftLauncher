@@ -27,7 +27,7 @@ func (a *app) sideButton(c *ui.Context, label string, selected bool) bool {
 
 func (a *app) downloadSidebar(c *ui.Context) {
 	sidebar(c).Children(func() {
-		for _, category := range []string{"游戏版本", "模组", "整合包", "光影"} {
+		for _, category := range []string{"游戏版本", "模组", "整合包", "光影", "数据包", "资源包", "世界"} {
 			if a.sideButton(c, category, category == a.resourceKind) && category != a.resourceKind {
 				a.resourceKind = category
 				a.leaveProject()
@@ -61,7 +61,12 @@ func taskProgress(message string) (progress float64, remaining string) {
 func (a *app) taskSidebar(c *ui.Context) {
 	sidebar(c).Children(func() {
 		percentage, rate, remaining := "—", "—", "—"
-		if task := a.jobs[downloadJob]; task != nil {
+		count := a.downloadCount()
+		if count > 1 {
+			ui.Textf(c, "%d 个下载任务进行中", count).FontSize(16).Bold()
+			return
+		}
+		if task := a.activeJob(downloadJob); task != nil {
 			progress, left := taskProgress(task.message)
 			remaining = left
 			if progress >= 0 {
@@ -89,14 +94,17 @@ func (a *app) taskView(c *ui.Context) {
 			ui.Text(c, "当前没有运行中的任务。").TextColor(a.theme.TextMuted)
 		}
 	})
-	for _, kind := range []jobKind{downloadJob, launchJob, catalogJob} {
-		if task := a.jobs[kind]; task != nil {
-			panel(c).Children(func() {
-				ui.Text(c, string(kind)).FontSize(16).Bold().TextColor(highlight)
-				ui.Text(c, task.message).TextColor(a.theme.TextMuted)
-				progress, _ := taskProgress(task.message)
-				ui.Progress(c, progress).Label(string(kind) + "进度")
+	for _, task := range a.jobs {
+		panel(c).Key(task).Children(func() {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, task.title).Grow(1).FontSize(16).Bold().TextColor(highlight)
+				if ui.Button(c, "取消").Label("取消 " + task.title).Disabled(task.cancelling).Clicked() {
+					task.requestCancel()
+				}
 			})
-		}
+			ui.Text(c, task.message).TextColor(a.theme.TextMuted)
+			progress, _ := taskProgress(task.message)
+			ui.Progress(c, progress).Label(task.title + "进度")
+		})
 	}
 }

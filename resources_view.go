@@ -16,12 +16,12 @@ type resourceGroup struct {
 	files []engine.ResourceVersion
 }
 
-func groupResourceVersions(versions []engine.ResourceVersion, catalog []engine.Version) []resourceGroup {
+func groupResourceVersions(versions []engine.ResourceVersion, catalog []engine.Version, kind string) []resourceGroup {
 	var groups []resourceGroup
 	index := map[loaderKey]int{}
 	for _, version := range versions {
 		loaders := version.Loaders
-		if len(loaders) == 0 {
+		if len(loaders) == 0 || kind == "datapack" || kind == "resourcepack" {
 			loaders = []string{""}
 		}
 		for _, game := range version.GameVersions {
@@ -58,8 +58,11 @@ func resourceMatches(kind string, i engine.Instance, v engine.ResourceVersion) b
 	if i.ID == "" || !slices.Contains(v.GameVersions, i.Version) {
 		return false
 	}
-	// Shader engines are installed in Minecraft and are independent of the instance's mod loader.
-	return kind == "shader" || (i.Loader != "" && slices.Contains(v.Loaders, i.Loader))
+	return resourceIgnoresLoader(kind) || (i.Loader != "" && slices.Contains(v.Loaders, i.Loader))
+}
+
+func resourceIgnoresLoader(kind string) bool {
+	return kind == "shader" || kind == "datapack" || kind == "resourcepack"
 }
 
 func (a *app) fetchProjectIcons(projects []engine.Project) {
@@ -141,8 +144,12 @@ func resourceFilter(c *ui.Context, label string, value *string, options []string
 }
 
 func (a *app) downloadView(c *ui.Context) {
-	if a.resourceKind == "游戏版本" {
+	switch a.resourceKind {
+	case "游戏版本":
 		a.versionsView(c)
+		return
+	case "世界":
+		a.worldDownloadView(c)
 		return
 	}
 	if a.project.ID != "" {
@@ -180,8 +187,11 @@ func (a *app) downloadView(c *ui.Context) {
 		ui.Row(c).Gap(8).Children(func() {
 			ui.Text(c, "游戏版本").FontSize(13)
 			gameChanged := resourceFilter(c, "筛选游戏版本", &state.game, games, func(s string) string { return s }, busy)
-			ui.Text(c, "加载器").FontSize(13)
-			loaderChanged := resourceFilter(c, "筛选加载器", &state.loader, loaders, resourceLoaderName, busy)
+			var loaderChanged bool
+			if a.kind() != "datapack" && a.kind() != "resourcepack" {
+				ui.Text(c, "加载器").FontSize(13)
+				loaderChanged = resourceFilter(c, "筛选加载器", &state.loader, loaders, resourceLoaderName, busy)
+			}
 			if gameChanged || loaderChanged {
 				a.submitResourceSearch(state)
 			}
@@ -218,6 +228,64 @@ func (a *app) downloadView(c *ui.Context) {
 			}
 		})
 	}
+}
+
+func (a *app) worldDownloadView(c *ui.Context) {
+	panel(c).Children(func() {
+		ui.Text(c, "下载 Java 版世界").FontSize(21).Bold()
+		if ui.Button(c, "浏览 Minecraft Maps").AlignSelf(ui.Start).Clicked() {
+			c.OpenURL("https://www.minecraftmaps.com/versions")
+		}
+		target := a.resourceDestination(c, "world")
+		ui.Text(c, "确认地图支持目标实例的游戏版本，再粘贴 ZIP 文件的直接下载链接。").
+			FontSize(13).TextColor(a.theme.TextMuted)
+		input := ui.TextInput(c, &a.worldURL).Label("世界 ZIP 下载链接").Placeholder("https://…")
+		source := strings.TrimSpace(a.worldURL)
+		key := resourceDownloadKey("world", source, "")
+		disabled := target.ID == "" || source == "" || a.gameInUse(target) || a.downloading(key, target.ID)
+		if ui.PrimaryButton(c, "下载并安装世界").AlignSelf(ui.Start).Disabled(disabled).Clicked() || input.Submitted() && !disabled {
+			a.startDownload(key, "世界 · "+target.Name, target.ID, "正在准备下载世界…", func(ctx context.Context, status func(string)) (func(), error) {
+				name, err := a.engine.DownloadWorld(ctx, target, source, status)
+				return func() {
+					a.datapackInstance = ""
+					a.status = "已安装世界 " + name + " · " + target.Name
+				}, err
+			})
+		}
+	})
+}
+
+func (a *app) datapackWorldPicker(c *ui.Context, target engine.Instance) {
+	if target.ID == "" {
+		return
+	}
+	if a.datapackInstance != target.ID {
+		a.datapackInstance, a.datapackWorld = target.ID, ""
+		worlds, err := a.engine.Worlds(target)
+		a.datapackWorlds = worlds
+		if err != nil {
+			a.status = err.Error()
+		}
+	}
+	if len(a.datapackWorlds) == 0 {
+		ui.Text(c, "该实例还没有存档。先创建或下载一个世界。").FontSize(13).TextColor(a.theme.TextMuted)
+		return
+	}
+	ui.Row(c).Gap(8).Children(func() {
+		ui.Text(c, "目标存档").FontSize(13)
+		placeholder := "请选择存档"
+		selected := a.datapackWorld
+		if selected == "" {
+			selected = placeholder
+		}
+		options := append([]string{placeholder}, a.datapackWorlds...)
+		if ui.Select(c, &selected, options).Grow(1).Label("安装目标存档").Changed() {
+			a.datapackWorld = selected
+			if selected == placeholder {
+				a.datapackWorld = ""
+			}
+		}
+	})
 }
 
 func (a *app) resourceRow(c *ui.Context, project engine.Project, busy bool) {
@@ -330,11 +398,16 @@ func (a *app) resourceDetails(c *ui.Context) {
 		ui.Row(c).Gap(8).Children(func() {
 			ui.Text(c, "游戏版本").FontSize(13)
 			resourceFilter(c, "筛选文件的游戏版本", &a.fileGame, games, func(s string) string { return s }, false)
-			ui.Text(c, "加载器").FontSize(13)
-			resourceFilter(c, "筛选文件的加载器", &a.fileLoader, loaders, resourceLoaderName, false)
+			if kind != "datapack" && kind != "resourcepack" {
+				ui.Text(c, "加载器").FontSize(13)
+				resourceFilter(c, "筛选文件的加载器", &a.fileLoader, loaders, resourceLoaderName, false)
+			}
 		})
 		if kind != "modpack" {
 			target = a.resourceDestination(c, kind)
+		}
+		if kind == "datapack" {
+			a.datapackWorldPicker(c, target)
 		}
 	})
 	matched := false
@@ -346,6 +419,9 @@ func (a *app) resourceDetails(c *ui.Context) {
 		panel(c).Key(group.key.game+"/"+group.key.loader).Padding(7, 12).Children(func() {
 			expanded := a.openResourceGroups[group.key]
 			title := resourceLoaderName(group.key.loader) + " " + group.key.game
+			if kind == "datapack" || kind == "resourcepack" {
+				title = "Minecraft " + group.key.game
+			}
 			if accordionHeader(c, fmt.Sprintf("%s（%d）", title, len(group.files)), expanded, false) {
 				a.openResourceGroups[group.key] = !expanded
 			}
@@ -365,14 +441,27 @@ func (a *app) resourceDetails(c *ui.Context) {
 							}
 							ui.Text(c, details).FontSize(12).TextColor(a.theme.TextMuted)
 						})
-						hint := "需要对应版本和加载器的空闲实例"
+						hint := "需要对应版本的可用实例"
+						if !resourceIgnoresLoader(kind) {
+							hint = "需要对应版本和加载器的可用实例"
+						}
 						if kind == "modpack" {
 							hint = "下载并创建新实例"
+						} else if kind == "datapack" {
+							hint = "选择版本匹配的实例及存档"
+							if destination.ID != "" {
+								hint = "安装到 " + destination.Name + " / " + a.datapackWorld
+							}
 						} else if destination.ID != "" {
 							hint = "安装到 " + destination.Name
 						}
+						world := ""
+						if kind == "datapack" {
+							world = a.datapackWorld
+						}
+						key := resourceDownloadKey(kind, file.ID, world)
 						if ui.Button(c, "安装").Label("安装 " + file.Name).Tooltip(hint).
-							Disabled(kind != "modpack" && destination.ID == "" || a.busy(downloadJob)).Clicked() {
+							Disabled(kind != "modpack" && destination.ID == "" || a.downloading(key, destination.ID)).Clicked() {
 							a.installResource(file, destination)
 						}
 					})
@@ -390,7 +479,7 @@ func recommendedGroups(groups []resourceGroup, kind string, target engine.Instan
 		return groups
 	}
 	index := slices.IndexFunc(groups, func(group resourceGroup) bool {
-		return group.key.game == target.Version && (kind == "shader" || group.key.loader == target.Loader)
+		return group.key.game == target.Version && (resourceIgnoresLoader(kind) || group.key.loader == target.Loader)
 	})
 	if index <= 0 {
 		return groups
@@ -403,8 +492,14 @@ func recommendedGroups(groups []resourceGroup, kind string, target engine.Instan
 
 func (a *app) fileDestination(kind string, group loaderKey, file engine.ResourceVersion, preferred engine.Instance) engine.Instance {
 	matches := func(i engine.Instance) bool {
-		return i.Version == group.game && (kind == "shader" || i.Loader == group.loader) &&
-			resourceMatches(kind, i, file) && !a.inUse(i)
+		return i.Version == group.game && (resourceIgnoresLoader(kind) || i.Loader == group.loader) &&
+			resourceMatches(kind, i, file) && !a.gameInUse(i)
+	}
+	if kind == "datapack" {
+		if a.datapackWorld != "" && preferred.ID == a.datapackInstance && matches(preferred) {
+			return preferred
+		}
+		return engine.Instance{}
 	}
 	if matches(preferred) {
 		return preferred
@@ -414,7 +509,7 @@ func (a *app) fileDestination(kind string, group loaderKey, file engine.Resource
 			return i
 		}
 	}
-	if resourceMatches(kind, preferred, file) && !a.inUse(preferred) {
+	if resourceMatches(kind, preferred, file) && !a.gameInUse(preferred) {
 		return preferred
 	}
 	return engine.Instance{}
@@ -423,15 +518,23 @@ func (a *app) fileDestination(kind string, group loaderKey, file engine.Resource
 func (a *app) resourceDestination(c *ui.Context, kind string) engine.Instance {
 	var compatible []engine.Instance
 	for _, instance := range a.instances {
+		if kind == "world" {
+			compatible = append(compatible, instance)
+			continue
+		}
 		for _, group := range a.resourceGroups {
-			if group.key.game == instance.Version && (kind == "shader" || group.key.loader == instance.Loader && instance.Loader != "") {
+			if group.key.game == instance.Version && (resourceIgnoresLoader(kind) || group.key.loader == instance.Loader && instance.Loader != "") {
 				compatible = append(compatible, instance)
 				break
 			}
 		}
 	}
 	if len(compatible) == 0 {
-		ui.Text(c, "没有匹配的本地实例。请先安装对应的游戏版本和加载器。").FontSize(13).TextColor(a.theme.TextMuted)
+		message := "没有匹配的本地实例。请先安装对应的游戏版本。"
+		if !resourceIgnoresLoader(kind) && kind != "world" {
+			message = "没有匹配的本地实例。请先安装对应的游戏版本和加载器。"
+		}
+		ui.Text(c, message).FontSize(13).TextColor(a.theme.TextMuted)
 		return engine.Instance{}
 	}
 	target := compatible[0]

@@ -112,18 +112,24 @@ func (a *app) view(c *ui.Context) {
 		}
 		ui.Divider(c)
 		ui.Column(c).Background(ui.Hex("#182333")).Children(func() {
+			downloads := a.downloadCount()
 			for _, kind := range []jobKind{downloadJob, launchJob, catalogJob} {
-				task := a.jobs[kind]
+				task := a.activeJob(kind)
 				if task == nil {
 					continue
 				}
 				ui.Row(c).AlignItems(ui.Center).Padding(5, 16, 0, 16).Gap(9).Children(func() {
+					if kind == downloadJob && downloads > 1 {
+						ui.Textf(c, "%d 个下载任务进行中", downloads).Grow(1).FontSize(12).TextColor(a.theme.TextMuted)
+						if ui.Button(c, "查看下载任务").Clicked() {
+							a.navigate(tasksPage)
+						}
+						return
+					}
 					ui.Progress(c, -1).Width(66).Height(4).Label(string(kind) + "进度")
 					ui.Text(c, task.message).Grow(1).MaxLines(1).FontSize(12).TextColor(a.theme.TextMuted).Tooltip(task.message)
 					if ui.Button(c, "取消"+string(kind)).Disabled(task.cancelling).Clicked() {
-						task.cancelling = true
-						task.message = "正在取消并清理临时文件…"
-						task.cancel()
+						task.requestCancel()
 					}
 				})
 			}
@@ -298,7 +304,7 @@ func (a *app) manageView(c *ui.Context) {
 				a.status = "已刷新模组列表。"
 				a.refreshMods()
 			}
-			if ui.Button(c, "从文件安装").Disabled(a.busy(downloadJob) || a.inUse(i)).Clicked() {
+			if ui.Button(c, "从文件安装").Disabled(a.gameInUse(i)).Clicked() {
 				a.chooseFiles()
 			}
 			if ui.Button(c, "删除实例").TextColor(danger).Disabled(a.inUse(i)).Clicked() {
@@ -326,17 +332,18 @@ func (a *app) manageView(c *ui.Context) {
 			if name == "" {
 				name = strings.TrimSuffix(mod.Filename, ".disabled")
 			}
-			name = a.bilingualName(name, mod.ID)
-			if !matchesSearch(name+" "+mod.Filename, a.modFilter) {
+			if chinese := a.modNames.Name(mod.ID); chinese != "" {
+				name = chinese
+			}
+			if !matchesSearch(strings.Join([]string{name, mod.Name, mod.Version, mod.Filename}, " "), a.modFilter) {
 				continue
 			}
 			ui.Divider(c)
-			ui.Row(c).Gap(8).Children(func() {
-				text := ui.Text(c, name).Grow(1).MaxLines(1).Tooltip(mod.Filename)
+			ui.Row(c).Key(mod.Filename).Gap(10).AlignItems(ui.Center).MinHeight(52).Children(func() {
+				a.modRowInfo(c, mod, name)
 				label := "禁用"
 				if !mod.Enabled {
 					label = "启用"
-					text.TextColor(ui.Hex("#A0A0A0")).Strikethrough()
 				}
 				if ui.Button(c, label).Disabled(busy).Clicked() {
 					if err := a.engine.ToggleMod(i, mod); err != nil {
@@ -356,6 +363,34 @@ func (a *app) manageView(c *ui.Context) {
 				}
 			})
 		}
+	})
+}
+
+func (a *app) modRowInfo(c *ui.Context, mod engine.Mod, name string) {
+	if icon := a.modIcons[mod.Filename]; icon != nil {
+		ui.Image(c, icon).Size(34, 34).Shrink(0).Label(name + " 图标")
+	} else {
+		ui.Column(c).Size(34, 34).Shrink(0).Radius(6).Background(a.theme.Surface).Center().
+			Label(name + " 图标").Children(func() { ui.Text(c, "◇").TextColor(a.theme.TextMuted) })
+	}
+	ui.Column(c).Grow(1).MinWidth(0).Gap(3).Children(func() {
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			title := ui.Text(c, name).MaxLines(1).MinWidth(0).FontSize(15).Bold().Tooltip(mod.Filename)
+			if !mod.Enabled {
+				title.TextColor(a.theme.TextMuted).Strikethrough()
+			}
+			if mod.Version != "" {
+				ui.Text(c, "|  "+mod.Version).MaxLines(1).FontSize(13).TextColor(a.theme.TextMuted)
+			}
+		})
+		details := strings.TrimSuffix(strings.TrimSuffix(mod.Filename, ".disabled"), ".jar")
+		if mod.Description != "" {
+			details += ": " + strings.Join(strings.Fields(mod.Description), " ")
+		}
+		if len(mod.Tags) > 0 {
+			details = strings.Join(mod.Tags, " · ") + "  " + details
+		}
+		ui.Text(c, details).MaxLines(1).FontSize(12).TextColor(a.theme.TextMuted).Tooltip(details)
 	})
 }
 

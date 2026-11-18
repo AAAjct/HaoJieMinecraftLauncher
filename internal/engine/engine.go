@@ -24,6 +24,7 @@ var client = &http.Client{Timeout: 15 * time.Minute, Transport: func() *http.Tra
 type Engine struct {
 	DataDir  string
 	GameRoot string
+	JavaRoot string
 }
 
 func (e Engine) gameRoot() string {

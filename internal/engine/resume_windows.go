@@ -42,6 +42,14 @@ func (t transfer) lockResumeCache(ctx context.Context) (string, *os.File, error)
 	if err != nil {
 		return "", nil, nil
 	}
+	if err := waitFileLock(ctx, lock); err != nil {
+		lock.Close()
+		return "", nil, err
+	}
+	return filepath.Join(root, key), lock, nil
+}
+
+func waitFileLock(ctx context.Context, lock *os.File) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -49,16 +57,14 @@ func (t transfer) lockResumeCache(ctx context.Context) (string, *os.File, error)
 		err := windows.LockFileEx(windows.Handle(lock.Fd()),
 			windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &position)
 		if err == nil {
-			return filepath.Join(root, key), lock, nil
+			return nil
 		}
 		if !errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
-			lock.Close()
-			return "", nil, err
+			return err
 		}
 		select {
 		case <-ctx.Done():
-			lock.Close()
-			return "", nil, ctx.Err()
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}

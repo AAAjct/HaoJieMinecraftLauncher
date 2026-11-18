@@ -17,8 +17,8 @@ type importRequest struct {
 }
 
 func (a *app) receiveFiles(paths []string) {
-	if a.busy(downloadJob) || a.importConfirm {
-		a.status = "请等待当前导入或下载完成。"
+	if a.importConfirm {
+		a.status = "请先处理当前的导入确认。"
 		return
 	}
 	request := importRequest{instance: a.current()}
@@ -31,7 +31,7 @@ func (a *app) receiveFiles(paths []string) {
 		}
 	}
 	if len(request.mods) > 0 {
-		if request.instance.ID == "" || a.inUse(request.instance) {
+		if request.instance.ID == "" || a.gameInUse(request.instance) {
 			a.status = "请先选中一个当前可修改的实例，再导入模组。"
 			return
 		}
@@ -61,14 +61,19 @@ func (a *app) chooseFiles() {
 }
 
 func (a *app) installFiles(request importRequest) {
-	if a.busy(downloadJob) || (len(request.mods) > 0 && a.inUse(request.instance)) {
-		a.status = "目标实例或下载任务正在使用，请稍后重试。"
+	if len(request.mods) > 0 && a.gameInUse(request.instance) {
+		a.status = "目标实例正在启动或运行，请稍后重试。"
 		return
 	}
+	target := ""
 	if len(request.mods) > 0 {
-		a.downloadTarget = request.instance.ID
+		target = request.instance.ID
 	}
-	a.start(downloadJob, "正在读取本地文件…", func(ctx context.Context, status func(string)) (func(), error) {
+	kind := downloadJob
+	if len(request.packs) == 0 {
+		kind = importJob
+	}
+	a.startJob(&job{kind: kind, title: "从文件安装", target: target, message: "正在读取本地文件…"}, func(ctx context.Context, status func(string)) (func(), error) {
 		if len(request.mods) > 0 {
 			status("正在安装模组 · " + request.instance.Name)
 			if err := a.engine.InstallLocalMods(ctx, request.instance, request.mods); err != nil {

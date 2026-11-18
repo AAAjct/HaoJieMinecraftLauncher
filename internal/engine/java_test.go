@@ -49,10 +49,14 @@ func TestLiveJavaInstall(t *testing.T) {
 	if os.Getenv("HJML_INTEGRATION") != "1" {
 		t.Skip("set HJML_INTEGRATION=1 to download Azul Zulu Java")
 	}
-	e := Engine{DataDir: t.TempDir()}
+	exeDir := t.TempDir()
+	e := Engine{DataDir: t.TempDir(), JavaRoot: filepath.Join(exeDir, "Jdk")}
 	home, err := e.EnsureJava(t.Context(), 21, func(message string) { t.Log(message) })
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want := filepath.Join(exeDir, "Jdk", "Zulu 21"); home != want {
+		t.Fatalf("Java installed to %q, want %q", home, want)
 	}
 	output, err := exec.CommandContext(t.Context(), filepath.Join(home, "bin", "java.exe"), "-version").CombinedOutput()
 	if err != nil || !strings.Contains(string(output), `version "21.`) {

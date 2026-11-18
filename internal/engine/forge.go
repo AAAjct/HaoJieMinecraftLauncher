@@ -96,9 +96,8 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 	if err := os.Link(jar, filepath.Join(vanilla, i.Version+".jar")); err != nil {
 		return overlay, err
 	}
-	logPath := filepath.Join(cacheRoot, build+"-install.log")
 	status("正在执行 Forge 安装处理器…")
-	if err := runForge(ctx, java, installer, stage, logPath, status); err != nil {
+	if err := runForge(ctx, java, installer, stage, filepath.Join(cacheRoot, build+"-install-*.log"), status); err != nil {
 		return overlay, err
 	}
 	if err := readJSON(filepath.Join(stage, "versions", overlay.ID, overlay.ID+".json"), &overlay); err != nil {
@@ -132,11 +131,12 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 }
 
 func runForge(ctx context.Context, java, installer, stage, logPath string, status func(string)) error {
-	log, err := os.Create(logPath)
+	log, err := os.CreateTemp(filepath.Dir(logPath), filepath.Base(logPath))
 	if err != nil {
 		return err
 	}
 	defer log.Close()
+	logPath = log.Name()
 	cmd := exec.CommandContext(ctx, filepath.Join(java, "bin", "java.exe"), "-Djava.awt.headless=true", "-jar", installer, "--installClient", stage)
 	cmd.Dir = stage
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windowsNoConsole}

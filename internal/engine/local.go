@@ -90,8 +90,18 @@ func (e Engine) InstallLocalMods(ctx context.Context, instance Instance, paths [
 			return err
 		}
 	}
+	resourcePublishMu.Lock()
+	defer resourcePublishMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	for _, path := range paths {
+		name := filepath.Base(path)
+		for _, suffix := range []string{"", ".disabled"} {
+			if _, err := os.Lstat(filepath.Join(dir, name+suffix)); !os.IsNotExist(err) {
+				return fmt.Errorf("目标实例中已有 %s，或无法访问同名文件", name)
+			}
+		}
 	}
 	var published []string
 	for _, path := range paths {

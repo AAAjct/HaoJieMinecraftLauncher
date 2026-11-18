@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -141,9 +142,18 @@ func TestModrinthResources(t *testing.T) {
 	if err := os.MkdirAll(e.GameDir(i), 0700); err != nil {
 		t.Fatal(err)
 	}
+	world := filepath.Join(e.GameDir(i), "saves", "测试世界")
+	if err := os.MkdirAll(world, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(world, "level.dat"), []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, target := range []struct{ kind, slug, folder string }{
 		{"mod", "sodium", "mods"},
 		{"shader", "complementary-reimagined", "shaderpacks"},
+		{"resourcepack", "fresh-animations", "resourcepacks"},
+		{"datapack", "terralith", "saves/测试世界/datapacks"},
 	} {
 		filter := i
 		if target.kind == "shader" {
@@ -160,7 +170,16 @@ func TestModrinthResources(t *testing.T) {
 		if err != nil || len(versions) == 0 {
 			t.Fatalf("versions for %s: %v", target.slug, err)
 		}
-		if err := e.InstallResource(t.Context(), target.kind, i, versions[0], func(string) {}); err != nil {
+		index := slices.IndexFunc(versions, func(v ResourceVersion) bool { return slices.Contains(v.GameVersions, i.Version) })
+		if index < 0 {
+			t.Fatalf("no compatible %s version", target.kind)
+		}
+		if target.kind == "datapack" {
+			err = e.InstallDatapack(t.Context(), i, "测试世界", versions[index], func(string) {})
+		} else {
+			err = e.InstallResource(t.Context(), target.kind, i, versions[index], func(string) {})
+		}
+		if err != nil {
 			t.Fatal(err)
 		}
 		files, err := os.ReadDir(filepath.Join(e.GameDir(i), target.folder))

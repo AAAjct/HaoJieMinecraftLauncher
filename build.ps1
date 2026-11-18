@@ -10,8 +10,8 @@ try {
     $built = Join-Path $staging 'windows-amd64'
     $output = Join-Path $distribution 'windows-amd64'
     New-Item -ItemType Directory -Path $output -Force | Out-Null
-    $exe = Join-Path $output 'HaoJieMinecraftLauncher.exe'
-    Copy-Item -LiteralPath (Join-Path $built 'HaoJieMinecraftLauncher.exe') -Destination $exe -Force
+    $exe = Join-Path $output 'HJML.exe'
+    Copy-Item -LiteralPath (Join-Path $built 'HJML.exe') -Destination $exe -Force
     $oldIcon = Join-Path $output 'icon.png'
     if (Test-Path -LiteralPath $oldIcon -PathType Leaf) {
         Remove-Item -LiteralPath $oldIcon -Force
