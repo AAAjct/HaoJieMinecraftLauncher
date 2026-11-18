@@ -27,7 +27,7 @@ func (a *app) sideButton(c *ui.Context, label string, selected bool) bool {
 
 func (a *app) downloadSidebar(c *ui.Context) {
 	sidebar(c).Children(func() {
-		for _, category := range []string{"游戏版本", "模组", "整合包", "光影", "数据包", "资源包", "世界"} {
+		for _, category := range []string{"游戏版本", "模组", "整合包", "光影", "数据包", "资源包"} {
 			if a.sideButton(c, category, category == a.resourceKind) && category != a.resourceKind {
 				a.resourceKind = category
 				a.leaveProject()
@@ -40,22 +40,24 @@ func (a *app) downloadSidebar(c *ui.Context) {
 }
 
 var ratioPattern = regexp.MustCompile(`([0-9]+)/([0-9]+)`)
-var percentPattern = regexp.MustCompile(`([0-9]+)%`)
+var percentPattern = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%`)
 var ratePattern = regexp.MustCompile(`([0-9]+\.[0-9]+ MiB/s)`)
 
 func taskProgress(message string) (progress float64, remaining string) {
+	progress, remaining = -1, "—"
 	if counts := ratioPattern.FindStringSubmatch(message); len(counts) == 3 {
 		done, _ := strconv.Atoi(counts[1])
 		total, _ := strconv.Atoi(counts[2])
 		if total > 0 {
-			return min(1, float64(done)/float64(total)), strconv.Itoa(max(0, total-done))
+			progress = min(1, float64(done)/float64(total))
+			remaining = strconv.Itoa(max(0, total-done))
 		}
 	}
 	if percent := percentPattern.FindStringSubmatch(message); len(percent) == 2 {
-		value, _ := strconv.Atoi(percent[1])
-		return min(1, float64(value)/100), "—"
+		value, _ := strconv.ParseFloat(percent[1], 64)
+		progress = min(1, value/100)
 	}
-	return -1, "—"
+	return progress, remaining
 }
 
 func (a *app) taskSidebar(c *ui.Context) {
@@ -70,7 +72,7 @@ func (a *app) taskSidebar(c *ui.Context) {
 			progress, left := taskProgress(task.message)
 			remaining = left
 			if progress >= 0 {
-				percentage = fmt.Sprintf("%.0f%%", progress*100)
+				percentage = fmt.Sprintf("%.1f%%", progress*100)
 			}
 			if match := ratePattern.FindStringSubmatch(task.message); len(match) == 2 {
 				rate = match[1]

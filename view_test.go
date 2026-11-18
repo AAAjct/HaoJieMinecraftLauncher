@@ -334,7 +334,7 @@ func TestMainNavigation(t *testing.T) {
 	}
 	for _, step := range []struct{ button, text string }{
 		{"下载", "Minecraft 版本"},
-		{"实例管理", "安装实例后可在此管理模组。"},
+		{"实例管理", "安装实例后可在此管理版本。"},
 		{"任务", "任务管理"},
 		{"启动", "离线玩家"},
 	} {
@@ -352,8 +352,11 @@ func TestDownloadCategoriesAndLocalImportLayout(t *testing.T) {
 	a.page = downloadsPage
 	test := ui.NewTester(a.view, 830, 565)
 	test.Frame()
+	if test.HasText("世界") {
+		t.Fatal("world downloads should not appear in the download sidebar")
+	}
 	for _, entry := range []struct{ name, field string }{
-		{"数据包", "搜索数据包"}, {"资源包", "搜索资源包"}, {"世界", "世界 ZIP 下载链接"},
+		{"数据包", "搜索数据包"}, {"资源包", "搜索资源包"},
 	} {
 		if err := test.Click(entry.name); err != nil {
 			t.Fatal(err)

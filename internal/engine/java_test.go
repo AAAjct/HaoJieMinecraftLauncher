@@ -50,16 +50,42 @@ func TestLiveJavaInstall(t *testing.T) {
 		t.Skip("set HJML_INTEGRATION=1 to download Azul Zulu Java")
 	}
 	exeDir := t.TempDir()
-	e := Engine{DataDir: t.TempDir(), JavaRoot: filepath.Join(exeDir, "Jdk")}
-	home, err := e.EnsureJava(t.Context(), 21, func(message string) { t.Log(message) })
+	e := Engine{DataDir: t.TempDir(), JavaRoot: filepath.Join(exeDir, "jdk")}
+	want := filepath.Join(exeDir, "jdk", "zulu 25")
+	if err := os.MkdirAll(filepath.Join(want, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	home, err := e.EnsureJava(t.Context(), 25, func(string) {})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := filepath.Join(exeDir, "Jdk", "Zulu 21"); home != want {
+	if home != want {
 		t.Fatalf("Java installed to %q, want %q", home, want)
 	}
 	output, err := exec.CommandContext(t.Context(), filepath.Join(home, "bin", "java.exe"), "-version").CombinedOutput()
-	if err != nil || !strings.Contains(string(output), `version "21.`) {
+	if err != nil || !strings.Contains(string(output), `version "25`) {
 		t.Fatalf("downloaded JDK failed: %v\n%s", err, output)
+	}
+	if found, err := e.EnsureJava(t.Context(), 25, func(status string) {
+		t.Fatalf("existing JDK should be reused immediately, got %q", status)
+	}); found != home || err != nil {
+		t.Fatalf("JDK reuse: %q %v", found, err)
+	}
+}
+
+func TestNormalizeJDKDirectoryCase(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(parent, "Jdk", "Zulu 21"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(parent, "jdk")
+	for _, name := range []string{root, filepath.Join(root, "zulu 21")} {
+		if err := normalizeDirectoryCase(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Dir(name))
+		if err != nil || len(entries) != 1 || entries[0].Name() != filepath.Base(name) {
+			t.Fatalf("directory name did not change to %s: %v (%v)", name, entries, err)
+		}
 	}
 }

@@ -85,6 +85,9 @@ func expandArgs(raw []json.RawMessage, values *strings.Replacer) ([]string, erro
 }
 
 func (e Engine) Launch(ctx context.Context, instance Instance, account Account, memory int, status func(string)) (*Game, error) {
+	lock := e.versionLock(instance)
+	lock.RLock()
+	defer lock.RUnlock()
 	ctx = e.resumableDownloads(ctx)
 	if instance.legacy {
 		e.GameRoot = ""
@@ -129,7 +132,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		}
 	}()
 	for _, archive := range archives {
-		if err := extractNatives(archive, native); err != nil {
+		if err := extractNatives(ctx, archive, native); err != nil {
 			return nil, err
 		}
 	}
@@ -211,7 +214,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 
 const windowsNoConsole = 0x08000000
 
-func extractNatives(archive, directory string) error {
+func extractNatives(ctx context.Context, archive, directory string) error {
 	z, err := zip.OpenReader(archive)
 	if err != nil {
 		return err
@@ -225,14 +228,14 @@ func extractNatives(archive, directory string) error {
 		if !segment(name) {
 			return fmt.Errorf("无效 Windows 原生库")
 		}
-		if err := writeZipEntry(entry, filepath.Join(directory, name)); err != nil {
+		if err := writeZipEntry(ctx, entry, filepath.Join(directory, name)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func writeZipEntry(entry *zip.File, target string) error {
+func writeZipEntry(ctx context.Context, entry *zip.File, target string) error {
 	if !entry.Mode().IsRegular() || entry.UncompressedSize64 > 512<<20 {
 		return fmt.Errorf("不支持的压缩条目 %s", entry.Name)
 	}
@@ -248,7 +251,7 @@ func writeZipEntry(entry *zip.File, target string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(output, source)
+	_, err = io.Copy(output, cancellableReader{ctx, source})
 	closeErr := output.Close()
 	if err != nil {
 		return err

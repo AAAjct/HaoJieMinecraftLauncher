@@ -4,16 +4,28 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 var instancePublishMu sync.Mutex
+var versionLocks sync.Map
+
+func (e Engine) versionLock(instance Instance) *sync.RWMutex {
+	if instance.legacy {
+		e.GameRoot = ""
+	}
+	key := filepath.Join(e.gameRoot(), "versions", instance.Version)
+	lock, _ := versionLocks.LoadOrStore(key, &sync.RWMutex{})
+	return lock.(*sync.RWMutex)
+}
 
 type Instance struct {
 	ID      string
@@ -24,6 +36,16 @@ type Instance struct {
 	Java    int
 	Created time.Time
 	legacy  bool
+}
+
+func (i Instance) DefaultName() string {
+	if i.Loader == "" {
+		return i.Version
+	}
+	if i.Build == "" {
+		return i.Version + "-" + i.Loader
+	}
+	return i.Version + "-" + i.Loader + "_" + i.Build
 }
 
 type Mod struct {
@@ -79,18 +101,80 @@ func (e Engine) RenameInstance(instance Instance, name string) error {
 	if name == "" || strings.ContainsAny(name, "\r\n\x00") {
 		return fmt.Errorf("请输入有效的实例名称")
 	}
+	instancePublishMu.Lock()
+	defer instancePublishMu.Unlock()
 	dir, saved, err := e.instanceMetadata(instance)
 	if err != nil {
 		return err
 	}
-	saved.Name = name
+	saved.Name, err = e.availableInstanceName(name, e.GameDir(instance))
+	if err != nil {
+		return err
+	}
 	return writeJSON(filepath.Join(dir, "instance.json"), saved)
 }
 
+// The caller holds instancePublishMu until it saves the allocated name.
+func (e Engine) availableInstanceName(name, currentDir string) (string, error) {
+	instances, err := e.Instances()
+	if err != nil {
+		return "", err
+	}
+	used := make(map[string]bool, len(instances))
+	for _, instance := range instances {
+		if e.GameDir(instance) != currentDir {
+			used[strings.ToLower(strings.TrimSpace(instance.Name))] = true
+		}
+	}
+	candidate := name
+	for n := 1; used[strings.ToLower(candidate)]; n++ {
+		candidate = name + "(" + strconv.Itoa(n) + ")"
+	}
+	return candidate, nil
+}
+
 func (e Engine) RemoveInstance(instance Instance) error {
-	dir, _, err := e.instanceMetadata(instance)
+	dir, saved, err := e.instanceMetadata(instance)
 	if err != nil {
 		return err
+	}
+	saved.legacy = instance.legacy
+	lock := e.versionLock(saved)
+	if !lock.TryLock() {
+		return fmt.Errorf("Minecraft %s 正在安装或启动，请稍后删除", saved.Version)
+	}
+	defer lock.Unlock()
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	return e.removeUnusedVersion(saved)
+}
+
+func (e Engine) removeUnusedVersion(removed Instance) error {
+	if !segment(removed.Version) || strings.HasPrefix(removed.Version, ".") {
+		return nil
+	}
+	if removed.legacy {
+		e.GameRoot = ""
+	}
+	instances, err := e.Instances()
+	if err != nil {
+		return err
+	}
+	for _, instance := range instances {
+		if instance.Version == removed.Version && (e.GameRoot == "" || !instance.legacy) {
+			return nil
+		}
+	}
+	profilePath := e.baseVersionFile(removed.Version, ".json")
+	dir := filepath.Dir(profilePath)
+	// The versions directory can also contain instance data.
+	if _, err := os.Lstat(filepath.Join(dir, "instance.json")); !os.IsNotExist(err) {
+		return nil
+	}
+	var profile gameProfile
+	if readJSON(profilePath, &profile) != nil || profile.ID != removed.Version {
+		return nil
 	}
 	return os.RemoveAll(dir)
 }
@@ -117,20 +201,30 @@ func (e Engine) Install(ctx context.Context, instance Instance, status func(stri
 	return e.createInstance(ctx, instance, nil, status)
 }
 
-func (e Engine) createInstance(ctx context.Context, instance Instance, setup func(string) error, status func(string)) (Instance, error) {
-	ctx = e.resumableDownloads(ctx)
-	if strings.TrimSpace(instance.Name) == "" {
-		instance.Name = instance.Version
-		if instance.Loader != "" {
-			instance.Name += " · " + instance.Loader
+func (e Engine) createInstance(ctx context.Context, instance Instance, setup func(string) error, status func(string)) (_ Instance, installErr error) {
+	lock := e.versionLock(instance)
+	lock.RLock()
+	defer func() {
+		lock.RUnlock()
+		if installErr == nil || !errors.Is(context.Cause(ctx), ErrTaskCanceled) || !lock.TryLock() {
+			return
 		}
-	}
+		defer lock.Unlock()
+		if err := e.removeUnusedVersion(instance); err != nil {
+			installErr = errors.Join(installErr, fmt.Errorf("清理版本缓存：%w", err))
+		}
+	}()
+	ctx = e.resumableDownloads(ctx)
 	if instance.Loader != "" && instance.Build == "" {
 		build, err := nextLoader(ctx, instance.Version, instance.Loader)
 		if err != nil {
 			return Instance{}, err
 		}
 		instance.Build = build
+	}
+	instance.Name = strings.TrimSpace(instance.Name)
+	if instance.Name == "" {
+		instance.Name = instance.DefaultName()
 	}
 	root := filepath.Join(e.DataDir, "instances")
 	if e.GameRoot != "" {
@@ -178,6 +272,10 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if err := ctx.Err(); err != nil {
 		return Instance{}, err
 	}
+	instance.Name, err = e.availableInstanceName(instance.Name, "")
+	if err != nil {
+		return Instance{}, err
+	}
 	var id [12]byte
 	rand.Read(id[:])
 	idSuffix := hex.EncodeToString(id[:])
@@ -185,7 +283,7 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if e.GameRoot != "" {
 		instance.ID = instance.Version + "-Vanilla"
 		if instance.Loader != "" {
-			instance.ID = instance.Version + "-" + instance.Loader + "_" + instance.Build
+			instance.ID = instance.DefaultName()
 		}
 		if _, err := os.Stat(filepath.Join(root, instance.ID)); !os.IsNotExist(err) {
 			instance.ID += "-" + idSuffix[:8]

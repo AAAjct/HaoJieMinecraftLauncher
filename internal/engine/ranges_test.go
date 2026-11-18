@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -123,5 +124,103 @@ func TestResumeAcrossDownloadAttempts(t *testing.T) {
 				t.Fatalf("resumed %d of %d requests", resumed.Load(), parts)
 			}
 		})
+	}
+}
+
+func TestCancelTaskRemovesPartialDownload(t *testing.T) {
+	const size = 2 << 20
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, 64<<10))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	e := Engine{DataDir: t.TempDir()}
+	ctx, cancel := context.WithCancelCause(e.resumableDownloads(t.Context()))
+	defer cancel(nil)
+	targetDir := t.TempDir()
+	file := transfer{artifact{URL: server.URL, Size: size, SHA256: fmt.Sprintf("%x", sha256.Sum256(make([]byte, size)))}, filepath.Join(targetDir, "file.zip")}
+	err := file.ensureWithProgress(ctx, func(n, _ int64) {
+		if n > 0 {
+			cancel(ErrTaskCanceled)
+		}
+	})
+	if err == nil || context.Cause(ctx) != ErrTaskCanceled {
+		t.Fatalf("expected explicit cancellation, got %v", err)
+	}
+	entries, err := os.ReadDir(targetDir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("download temporary files remain: %v (%v)", entries, err)
+	}
+	entries, err = os.ReadDir(filepath.Join(e.DataDir, ".hjml-cache", "downloads"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			t.Fatalf("partial download cache remains: %s", entry.Name())
+		}
+	}
+}
+
+func TestDownloadProgressBeforeFirstFileCompletes(t *testing.T) {
+	content := make([]byte, 512<<10)
+	updated := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+		_, _ = w.Write(content[:256<<10])
+		w.(http.Flusher).Flush()
+		select {
+		case <-updated:
+			_, _ = w.Write(content[256<<10:])
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+	file := transfer{artifact{URL: server.URL, Size: int64(len(content))}, filepath.Join(t.TempDir(), "file")}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err := ensureAll(ctx, []transfer{file}, "下载", func(status string) {
+		if strings.Contains(status, "0/1 文件") && !strings.Contains(status, " · 0.0%") {
+			select {
+			case <-updated:
+			default:
+				close(updated)
+			}
+		}
+	})
+	if err != nil {
+		t.Fatalf("no byte progress appeared before the file finished: %v", err)
+	}
+}
+
+func TestDownloadsPreferFasterMirrorAndReuseProbe(t *testing.T) {
+	content := bytes.Repeat([]byte{1}, 512<<10)
+	var slowRequests, fastRequests atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		slowRequests.Add(1)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Second):
+			http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(content))
+		}
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fastRequests.Add(1)
+		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(content))
+	}))
+	defer fast.Close()
+	ctx := withSourcePreferences(t.Context())
+	for _, name := range []string{"one.jar", "two.jar"} {
+		file := artifact{URL: slow.URL + "/" + name, Mirrors: []string{fast.URL + "/" + name},
+			Size: int64(len(content)), SHA256: fmt.Sprintf("%x", sha256.Sum256(content))}
+		if err := (transfer{file, filepath.Join(t.TempDir(), name)}).ensure(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if fastRequests.Load() != 3 || slowRequests.Load() > 1 {
+		t.Fatalf("expected one speed probe followed by both downloads on the faster mirror, got slow=%d fast=%d", slowRequests.Load(), fastRequests.Load())
 	}
 }

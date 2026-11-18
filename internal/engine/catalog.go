@@ -15,8 +15,7 @@ const bmcl = "https://bmclapi2.bangbang93.com"
 
 type catalogSource[T any] func(context.Context) (T, error)
 
-// The official source gets a head start. A slow or failed request does not
-// hold up a healthy mirror. Cancel the remaining request after a success.
+// Use the first successful response and cancel the remaining requests.
 func firstCatalog[T any](ctx context.Context, sources ...catalogSource[T]) (T, error) {
 	ctx, cancel := context.WithTimeout(ctx, 9*time.Second)
 	defer cancel()
@@ -25,18 +24,12 @@ func firstCatalog[T any](ctx context.Context, sources ...catalogSource[T]) (T, e
 		err   error
 	}
 	results := make(chan response, len(sources))
-	started := 0
-	start := func() {
-		fetch := sources[started]
-		started++
+	for _, fetch := range sources {
 		go func() {
 			value, err := fetch(ctx)
 			results <- response{value, err}
 		}()
 	}
-	start()
-	hedge := time.NewTimer(350 * time.Millisecond)
-	defer hedge.Stop()
 	finished := 0
 	var last error
 	for finished < len(sources) {
@@ -44,19 +37,12 @@ func firstCatalog[T any](ctx context.Context, sources ...catalogSource[T]) (T, e
 		case <-ctx.Done():
 			var empty T
 			return empty, ctx.Err()
-		case <-hedge.C:
-			if started < len(sources) {
-				start()
-			}
 		case result := <-results:
 			if result.err == nil {
 				return result.value, nil
 			}
 			last = errors.Join(last, result.err)
 			finished++
-			if started < len(sources) {
-				start()
-			}
 		}
 	}
 	var empty T

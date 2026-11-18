@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,76 @@ func TestDefaultChineseOptions(t *testing.T) {
 		if got, err := os.ReadFile(options); err != nil || string(got) != tc.want {
 			t.Fatalf("options: %q: %v", got, err)
 		}
+	}
+}
+
+func TestDefaultInstanceName(t *testing.T) {
+	for _, args := range []struct{ loader, build, name string }{
+		{"", "", "26.3"},
+		{"fabric", "0.20.1", "26.3-fabric_0.20.1"},
+		{"fabric", "0.20.2", "26.3-fabric_0.20.2"},
+	} {
+		instance := Instance{Version: "26.3", Loader: args.loader, Build: args.build}
+		if name := instance.DefaultName(); name != args.name {
+			t.Fatalf("default name = %q, want %q", name, args.name)
+		}
+	}
+}
+
+func TestRemoveInstanceCleansVersionAfterLastUse(t *testing.T) {
+	e := Engine{DataDir: t.TempDir(), GameRoot: t.TempDir()}
+	first := Instance{ID: "1.21.1-Vanilla", Version: "1.21.1"}
+	second := Instance{ID: "1.21.1-fabric_0.18.1", Version: first.Version}
+	for _, instance := range []Instance{first, second} {
+		if err := os.MkdirAll(e.GameDir(instance), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeJSON(filepath.Join(e.GameDir(instance), "instance.json"), instance); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profilePath := e.baseVersionFile(first.Version, ".json")
+	if err := os.MkdirAll(filepath.Dir(profilePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(profilePath, gameProfile{ID: first.Version}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RemoveInstance(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(e.GameDir(first)); !os.IsNotExist(err) || !regularFile(profilePath) {
+		t.Fatal("first removal must delete its directory while retaining the shared version")
+	}
+	if err := e.RemoveInstance(second); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{e.GameDir(second), filepath.Dir(profilePath)} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("%s should have been removed: %v", dir, err)
+		}
+	}
+}
+
+func TestCanceledInstallRemovesUnusedVersion(t *testing.T) {
+	e := Engine{DataDir: t.TempDir(), GameRoot: t.TempDir()}
+	instance := Instance{Version: "26.3"}
+	profilePath := e.baseVersionFile(instance.Version, ".json")
+	if err := os.MkdirAll(filepath.Dir(profilePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	profile := gameProfile{ID: instance.Version, MainClass: "Main"}
+	profile.Downloads.Client.URL = "https://invalid.example/client.jar"
+	if err := writeJSON(profilePath, profile); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	if _, err := e.Install(ctx, instance, func(string) { cancel(ErrTaskCanceled) }); err == nil {
+		t.Fatal("canceled installation should fail")
+	}
+	if entries, err := os.ReadDir(filepath.Dir(filepath.Dir(profilePath))); err != nil || len(entries) != 0 {
+		t.Fatalf("canceled installation left version or staging directories: %v (%v)", entries, err)
 	}
 }
 

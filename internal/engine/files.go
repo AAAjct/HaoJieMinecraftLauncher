@@ -70,7 +70,9 @@ func (t transfer) ensure(ctx context.Context) error {
 	return t.ensureWithProgress(ctx, nil)
 }
 
-func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, int64)) error {
+var ErrTaskCanceled = errors.New("任务已取消")
+
+func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, int64)) (result error) {
 	if t.ready() {
 		return nil
 	}
@@ -83,11 +85,18 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 	}
 	if lock != nil {
 		defer lock.Close()
+		defer func() {
+			if errors.Is(context.Cause(ctx), ErrTaskCanceled) {
+				if err := os.RemoveAll(cache); err != nil {
+					result = errors.Join(result, fmt.Errorf("无法清理下载缓存：%w", err))
+				}
+			}
+		}()
 		if t.ready() {
 			return nil
 		}
 	}
-	sources := append([]string{t.URL}, t.Mirrors...)
+	sources := t.orderedSources(ctx)
 	for attempt := range 3 {
 		for _, source := range sources {
 			if ctx.Err() != nil {
@@ -175,44 +184,81 @@ func (t transfer) saveTransfer(write func(*os.File, hash.Hash, int64) (int64, er
 }
 
 func ensureAll(ctx context.Context, work []transfer, label string, status func(string)) error {
-	work = slices.Clone(work)
-	slices.SortStableFunc(work, func(a, b transfer) int { return cmp.Compare(b.Size, a.Size) })
+	ctx = withSourcePreferences(ctx)
+	total := len(work)
+	var pending []transfer
+	var done int
+	var totalSize, downloaded int64
+	knownSize := true
+	for _, item := range work {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		totalSize += item.Size
+		knownSize = knownSize && item.Size > 0
+		if item.ready() {
+			done++
+			downloaded += item.Size
+		} else {
+			pending = append(pending, item)
+		}
+	}
+	slices.SortStableFunc(pending, func(a, b transfer) int { return cmp.Compare(b.Size, a.Size) })
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	status(fmt.Sprintf("%s · 0/%d", label, len(work)))
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var first error
-	var done int
-	var last time.Time
-	var totalBytes atomic.Int64
-	start := time.Now()
+	var received, lastBytes int64
+	last := time.Now()
 	emit := func() {
-		rate := float64(totalBytes.Load()) / (1 << 20) / max(time.Since(start).Seconds(), 0.1)
-		status(fmt.Sprintf("%s · %d/%d · %.1f MiB/s", label, done, len(work), rate))
-		last = time.Now()
-	}
-	newBytes := func(n, _ int64) {
-		if n > 0 {
-			totalBytes.Add(n)
+		now := time.Now()
+		rate := float64(received-lastBytes) / (1 << 20) / max(now.Sub(last).Seconds(), 0.1)
+		message := fmt.Sprintf("%s · %d/%d 文件", label, done, total)
+		if knownSize && totalSize > 0 {
+			message += fmt.Sprintf(" · %.1f%%（%.2f/%.2f MiB）", 100*float64(downloaded)/float64(totalSize), float64(downloaded)/(1<<20), float64(totalSize)/(1<<20))
+		} else {
+			message += fmt.Sprintf(" · 已接收 %.2f MiB", float64(received)/(1<<20))
 		}
+		status(fmt.Sprintf("%s · %.1f MiB/s", message, rate))
+		last, lastBytes = now, received
 	}
-	for range min(32, len(work)) {
+	emit()
+	for range min(32, len(pending)) {
 		wg.Go(func() {
 			for ctx.Err() == nil {
 				index := int(next.Add(1)) - 1
-				if index >= len(work) {
+				if index >= len(pending) {
 					return
 				}
-				err := work[index].ensureWithProgress(ctx, newBytes)
+				item := pending[index]
+				var credited int64
+				err := item.ensureWithProgress(ctx, func(n, _ int64) {
+					mu.Lock()
+					firstBytes := n > 0 && received == 0
+					before := credited
+					if n < 0 {
+						credited = 0
+					} else {
+						received += n
+						credited = min(item.Size, credited+n)
+					}
+					downloaded += credited - before
+					if firstBytes || time.Since(last) >= 250*time.Millisecond {
+						emit()
+					}
+					mu.Unlock()
+				})
 				mu.Lock()
-				if err != nil && first == nil {
+				if err == nil {
+					done++
+					downloaded += item.Size - credited
+				} else if first == nil {
 					first = err
 					cancel()
 				}
-				done++
-				if time.Since(last) > 250*time.Millisecond || done == len(work) {
+				if time.Since(last) >= 250*time.Millisecond || done == total {
 					emit()
 				}
 				mu.Unlock()

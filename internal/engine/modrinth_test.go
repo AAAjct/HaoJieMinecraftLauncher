@@ -58,6 +58,7 @@ func TestPackImportCreatesIsolatedInstance(t *testing.T) {
 		filepath.Join(e.GameRoot, "assets", "indexes", "test-assets.json"): "{}",
 		filepath.Join(e.javaHome(8), "bin", "java.exe"):                    "cached java",
 		filepath.Join(e.javaHome(8), "bin", "javac.exe"):                   "cached javac",
+		filepath.Join(e.javaHome(8), "release"):                            "JAVA_VERSION=\"1.8.0_472\"\n",
 	} {
 		if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
 			t.Fatal(err)
@@ -95,23 +96,62 @@ func TestPackImportCreatesIsolatedInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := e.ImportPack(t.Context(), path, func(string) {})
-	if err != nil {
-		t.Fatal(err)
+	if first.Name != "Fixture pack" || first.Java != 8 {
+		t.Fatalf("unexpected first instance: %+v", first)
 	}
-	if first.ID == second.ID || first.Name != "Fixture pack" || first.Java != 8 {
-		t.Fatalf("pack instances were not isolated: %+v, %+v", first, second)
+	type result struct {
+		instance Instance
+		err      error
 	}
-	for _, instance := range []Instance{first, second} {
+	results := make(chan result, 2)
+	go func() {
+		instance, err := e.ImportPack(t.Context(), path, func(string) {})
+		results <- result{instance, err}
+	}()
+	go func() {
+		instance, err := e.Install(t.Context(), Instance{Name: "Fixture pack", Version: version}, func(string) {})
+		results <- result{instance, err}
+	}()
+	instances := []Instance{first}
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		instances = append(instances, result.instance)
+	}
+	if !slices.ContainsFunc(instances, func(i Instance) bool { return i.Name == "Fixture pack(1)" }) ||
+		!slices.ContainsFunc(instances, func(i Instance) bool { return i.Name == "Fixture pack(2)" }) {
+		t.Fatalf("concurrent installations did not allocate distinct names: %+v", instances)
+	}
+	for _, instance := range instances {
 		if e.GameDir(instance) != filepath.Join(e.GameRoot, "versions", instance.ID) ||
 			!regularFile(filepath.Join(e.GameDir(instance), instance.ID+".jar")) ||
 			!regularFile(filepath.Join(e.GameDir(instance), instance.ID+".json")) {
 			t.Fatalf("incorrect portable layout: %s", e.GameDir(instance))
 		}
-		content, err := os.ReadFile(filepath.Join(e.GameDir(instance), "mods", "example.jar"))
-		if err != nil || string(content) != "pack mod" {
-			t.Fatalf("pack contents: %q (%v)", content, err)
-		}
+	}
+	content, err := os.ReadFile(filepath.Join(e.GameDir(first), "mods", "example.jar"))
+	if err != nil || string(content) != "pack mod" {
+		t.Fatalf("pack contents: %q (%v)", content, err)
+	}
+	if err := e.RenameInstance(first, "fixture PACK"); err != nil {
+		t.Fatal(err)
+	}
+	_, saved, err := e.instanceMetadata(first)
+	if err != nil || saved.Name != "fixture PACK" {
+		t.Fatalf("renaming the current instance should not add a suffix: %+v (%v)", saved, err)
+	}
+	fourth, err := e.Install(t.Context(), Instance{Name: "New instance", Version: version}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RenameInstance(fourth, "Fixture pack"); err != nil {
+		t.Fatal(err)
+	}
+	_, saved, err = e.instanceMetadata(fourth)
+	if err != nil || saved.Name != "Fixture pack(3)" {
+		t.Fatalf("renaming should skip all occupied suffixes: %+v (%v)", saved, err)
 	}
 }
 

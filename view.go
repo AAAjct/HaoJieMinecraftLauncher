@@ -282,7 +282,7 @@ func (a *app) manageView(c *ui.Context) {
 	i := a.current()
 	panel(c).Children(func() {
 		if i.ID == "" {
-			ui.Text(c, "安装实例后可在此管理模组。").TextColor(a.theme.TextMuted)
+			ui.Text(c, "安装实例后可在此管理版本。").TextColor(a.theme.TextMuted)
 			return
 		}
 		ui.Textf(c, "%s · %s", i.Version, loaderName(i)).TextColor(a.theme.TextMuted)
@@ -421,6 +421,7 @@ func (a *app) deleteInstanceDialog(c *ui.Context) {
 				if ui.Button(c, "确认删除实例").TextColor(danger).Disabled(a.inUse(i)).Clicked() {
 					a.deleteConfirm = false
 					if err := a.engine.RemoveInstance(i); err != nil {
+						a.refreshInstances()
 						a.status = err.Error()
 						return
 					}

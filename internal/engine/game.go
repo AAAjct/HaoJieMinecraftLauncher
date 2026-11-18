@@ -161,7 +161,8 @@ func (e Engine) baseProfile(ctx context.Context, version string) (gameProfile, e
 			if entry.ID != version {
 				continue
 			}
-			if err := (transfer{artifact{URL: entry.URL, SHA1: entry.SHA1}, target}).copyProfile(ctx); err != nil {
+			file := withMinecraftMirror(artifact{URL: entry.URL, SHA1: entry.SHA1}, minecraftMirror(entry.URL))
+			if err := (transfer{file, target}).copyProfile(ctx); err != nil {
 				return profile, err
 			}
 			found = true
@@ -187,7 +188,14 @@ func (t transfer) copyProfile(ctx context.Context) error {
 	if err := os.MkdirAll(filepath.Dir(t.target), 0700); err != nil {
 		return err
 	}
-	return t.copy(ctx)
+	var err error
+	for _, source := range t.orderedSources(ctx) {
+		t.URL = source
+		if err = t.copy(ctx); err == nil {
+			return nil
+		}
+	}
+	return err
 }
 
 func loaderURL(loader string) string {
@@ -319,7 +327,7 @@ func (e Engine) gameTransfers(profile gameProfile) (packages []transfer, classpa
 				err = pathErr
 				return
 			}
-			item := transfer{file, target}
+			item := transfer{withMinecraftMirror(file, minecraftMirror(file.URL)), target}
 			if file.URL == "" && !item.ready() {
 				err = fmt.Errorf("缺少安装器生成的运行库 %s", lib.Name)
 				return
@@ -335,17 +343,21 @@ func (e Engine) gameTransfers(profile gameProfile) (packages []transfer, classpa
 				err = fmt.Errorf("库 %s 缺少 Windows 原生文件", lib.Name)
 				return
 			}
-			packages = append(packages, transfer{native, target})
+			packages = append(packages, transfer{withMinecraftMirror(native, minecraftMirror(native.URL)), target})
 			natives = append(natives, target)
 		}
 	}
 	jar := e.baseVersionFile(profile.ID, ".jar")
-	packages = append(packages, transfer{profile.Downloads.Client, jar})
+	packages = append(packages, transfer{minecraftClient(profile), jar})
 	classpath = append(classpath, jar)
 	if file := profile.Logging.Client.File; segment(file.ID) && file.URL != "" {
-		packages = append(packages, transfer{file.artifact, filepath.Join(e.gameRoot(), "assets", "log_configs", file.ID)})
+		packages = append(packages, transfer{withMinecraftMirror(file.artifact, minecraftMirror(file.URL)), filepath.Join(e.gameRoot(), "assets", "log_configs", file.ID)})
 	}
 	return
+}
+
+func minecraftClient(profile gameProfile) artifact {
+	return withMinecraftMirror(profile.Downloads.Client, bmcl+"/version/"+url.PathEscape(profile.ID)+"/client")
 }
 
 type assetIndex struct {
@@ -380,7 +392,7 @@ func (e Engine) assetTransfers(ctx context.Context, profile gameProfile) ([]tran
 	}
 	assets := filepath.Join(e.gameRoot(), "assets")
 	indexPath := filepath.Join(assets, "indexes", profile.AssetIndex.ID+".json")
-	if err := (transfer{profile.AssetIndex.artifact, indexPath}).ensure(ctx); err != nil {
+	if err := (transfer{withMinecraftMirror(profile.AssetIndex.artifact, minecraftMirror(profile.AssetIndex.URL)), indexPath}).ensure(ctx); err != nil {
 		return nil, err
 	}
 	var index assetIndex

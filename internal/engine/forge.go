@@ -55,7 +55,8 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 	cacheRoot := filepath.Join(e.gameRoot(), "forge")
 	installer := filepath.Join(cacheRoot, build+"-installer.jar")
 	status("下载 Forge 安装器 · " + i.Build)
-	if err := (transfer{artifact{URL: addr, SHA1: checksum}, installer}).ensure(ctx); err != nil {
+	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, minecraftMirror(addr))
+	if err := (transfer{file, installer}).ensure(ctx); err != nil {
 		return overlay, err
 	}
 	z, err := zip.OpenReader(installer)
@@ -86,7 +87,7 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 		return overlay, err
 	}
 	jar := e.baseVersionFile(i.Version, ".jar")
-	if err := (transfer{base.Downloads.Client, jar}).ensure(ctx); err != nil {
+	if err := (transfer{minecraftClient(base), jar}).ensure(ctx); err != nil {
 		return overlay, err
 	}
 	vanilla := filepath.Join(stage, "versions", i.Version)

@@ -144,12 +144,8 @@ func resourceFilter(c *ui.Context, label string, value *string, options []string
 }
 
 func (a *app) downloadView(c *ui.Context) {
-	switch a.resourceKind {
-	case "游戏版本":
+	if a.resourceKind == "游戏版本" {
 		a.versionsView(c)
-		return
-	case "世界":
-		a.worldDownloadView(c)
 		return
 	}
 	if a.project.ID != "" {
@@ -230,31 +226,6 @@ func (a *app) downloadView(c *ui.Context) {
 	}
 }
 
-func (a *app) worldDownloadView(c *ui.Context) {
-	panel(c).Children(func() {
-		ui.Text(c, "下载 Java 版世界").FontSize(21).Bold()
-		if ui.Button(c, "浏览 Minecraft Maps").AlignSelf(ui.Start).Clicked() {
-			c.OpenURL("https://www.minecraftmaps.com/versions")
-		}
-		target := a.resourceDestination(c, "world")
-		ui.Text(c, "确认地图支持目标实例的游戏版本，再粘贴 ZIP 文件的直接下载链接。").
-			FontSize(13).TextColor(a.theme.TextMuted)
-		input := ui.TextInput(c, &a.worldURL).Label("世界 ZIP 下载链接").Placeholder("https://…")
-		source := strings.TrimSpace(a.worldURL)
-		key := resourceDownloadKey("world", source, "")
-		disabled := target.ID == "" || source == "" || a.gameInUse(target) || a.downloading(key, target.ID)
-		if ui.PrimaryButton(c, "下载并安装世界").AlignSelf(ui.Start).Disabled(disabled).Clicked() || input.Submitted() && !disabled {
-			a.startDownload(key, "世界 · "+target.Name, target.ID, "正在准备下载世界…", func(ctx context.Context, status func(string)) (func(), error) {
-				name, err := a.engine.DownloadWorld(ctx, target, source, status)
-				return func() {
-					a.datapackInstance = ""
-					a.status = "已安装世界 " + name + " · " + target.Name
-				}, err
-			})
-		}
-	})
-}
-
 func (a *app) datapackWorldPicker(c *ui.Context, target engine.Instance) {
 	if target.ID == "" {
 		return
@@ -268,7 +239,7 @@ func (a *app) datapackWorldPicker(c *ui.Context, target engine.Instance) {
 		}
 	}
 	if len(a.datapackWorlds) == 0 {
-		ui.Text(c, "该实例还没有存档。先创建或下载一个世界。").FontSize(13).TextColor(a.theme.TextMuted)
+		ui.Text(c, "该实例还没有存档。请先在游戏中创建一个世界。").FontSize(13).TextColor(a.theme.TextMuted)
 		return
 	}
 	ui.Row(c).Gap(8).Children(func() {
@@ -518,10 +489,6 @@ func (a *app) fileDestination(kind string, group loaderKey, file engine.Resource
 func (a *app) resourceDestination(c *ui.Context, kind string) engine.Instance {
 	var compatible []engine.Instance
 	for _, instance := range a.instances {
-		if kind == "world" {
-			compatible = append(compatible, instance)
-			continue
-		}
 		for _, group := range a.resourceGroups {
 			if group.key.game == instance.Version && (resourceIgnoresLoader(kind) || group.key.loader == instance.Loader && instance.Loader != "") {
 				compatible = append(compatible, instance)
@@ -531,7 +498,7 @@ func (a *app) resourceDestination(c *ui.Context, kind string) engine.Instance {
 	}
 	if len(compatible) == 0 {
 		message := "没有匹配的本地实例。请先安装对应的游戏版本。"
-		if !resourceIgnoresLoader(kind) && kind != "world" {
+		if !resourceIgnoresLoader(kind) {
 			message = "没有匹配的本地实例。请先安装对应的游戏版本和加载器。"
 		}
 		ui.Text(c, message).FontSize(13).TextColor(a.theme.TextMuted)

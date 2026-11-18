@@ -485,7 +485,7 @@ func installPackFiles(ctx context.Context, game string, index packIndex, archive
 			if err != nil {
 				return err
 			}
-			if err := writeZipEntry(entry, target); err != nil {
+			if err := writeZipEntry(ctx, entry, target); err != nil {
 				return err
 			}
 		}

@@ -2,7 +2,11 @@
   "name": "HJML",
   "slug": "hjml",
   "identifier": "com.haojie.hjml",
-  "version": "1.0.2",
+  "version": "1.0.3",
+  "copyright": "Jct",
+  "i18n": {
+    "source": "zh-Hans"
+  },
   "icon": "resources/icon.png",
   "out": "dist"
 }

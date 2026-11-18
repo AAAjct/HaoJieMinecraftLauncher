@@ -15,6 +15,7 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 	"hjml/internal/engine"
+	_ "hjml/locales"
 )
 
 const (
@@ -63,7 +64,7 @@ type app struct {
 	resourceGroups                             []resourceGroup
 	openResourceGroups                         map[loaderKey]bool
 	fileGame, fileLoader, resourceTarget       string
-	worldURL, datapackWorld, datapackInstance  string
+	datapackWorld, datapackInstance            string
 	datapackWorlds                             []string
 	resourceLoaders                            []engine.ResourceLoader
 	projectIcons                               map[string]ui.ImageSource
@@ -277,11 +278,11 @@ func (a *app) startJob(task *job, work operation) {
 		return
 	}
 	kind := task.kind
-	ctx, cancel := context.WithCancel(context.Background())
-	task.cancel = cancel
+	ctx, cancel := context.WithCancelCause(context.Background())
+	task.cancel = func() { cancel(engine.ErrTaskCanceled) }
 	a.jobs = append(a.jobs, task)
 	go func() {
-		defer cancel()
+		defer cancel(nil)
 		finish, err := work(ctx, func(s string) {
 			a.window.Update(func() {
 				if !task.cancelling && slices.Contains(a.jobs, task) {
@@ -319,7 +320,7 @@ func (a *app) startJob(task *job, work operation) {
 					a.refreshInstances()
 				}
 				a.status = err.Error()
-				if task.cancelling {
+				if _, cleanupFailed := err.(interface{ Unwrap() []error }); task.cancelling && !cleanupFailed {
 					a.status = string(kind) + "已取消。"
 				}
 			} else if finish != nil {
@@ -333,7 +334,7 @@ func (a *app) install() {
 	i := a.installSelection()
 	title := strings.TrimSpace(i.Name)
 	if title == "" {
-		title = "Minecraft " + i.Version + " · " + loaderName(i)
+		title = i.DefaultName()
 	}
 	a.startDownload(versionDownloadKey(i), title, "", "正在准备安装 Minecraft…", func(ctx context.Context, status func(string)) (func(), error) {
 		i, err := a.engine.Install(ctx, i, status)
@@ -423,8 +424,6 @@ func (a *app) kind() string {
 		return "datapack"
 	case "资源包":
 		return "resourcepack"
-	case "世界":
-		return "world"
 	default:
 		return ""
 	}
@@ -655,7 +654,7 @@ func main() {
 	}
 	exeDir := filepath.Dir(exe)
 	gameRoot := filepath.Join(exeDir, ".minecraft")
-	a := newApp(engine.Engine{DataDir: filepath.Join(data, "HJML"), GameRoot: gameRoot, JavaRoot: filepath.Join(exeDir, "Jdk")})
+	a := newApp(engine.Engine{DataDir: filepath.Join(data, "HJML"), GameRoot: gameRoot, JavaRoot: filepath.Join(exeDir, "jdk")})
 	catalogCtx, stopCatalog := context.WithCancel(context.Background())
 	defer stopCatalog()
 	a.catalogContext = catalogCtx
