@@ -203,6 +203,7 @@ func resolveMods(ctx context.Context, instance Instance, root ResourceVersion) (
 }
 
 func (e Engine) InstallResource(ctx context.Context, kind string, instance Instance, version ResourceVersion, status func(string)) error {
+	ctx = e.resumableDownloads(ctx)
 	var files []resourceFile
 	var err error
 	var folder string
@@ -289,6 +290,7 @@ type packIndex struct {
 }
 
 func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, status func(string)) (Instance, error) {
+	ctx = e.resumableDownloads(ctx)
 	file, err := version.selectedFile(".mrpack")
 	if err != nil {
 		return Instance{}, err
@@ -310,6 +312,7 @@ func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, statu
 }
 
 func (e Engine) ImportPack(ctx context.Context, path string, status func(string)) (Instance, error) {
+	ctx = e.resumableDownloads(ctx)
 	z, err := zip.OpenReader(path)
 	if err != nil {
 		return Instance{}, err

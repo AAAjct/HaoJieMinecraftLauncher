@@ -221,6 +221,38 @@ func TestInstallTargetsMatchFileGroup(t *testing.T) {
 	}
 }
 
+func TestResourceDetailsRecommendsSelectedInstance(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.page, a.resourceKind = downloadsPage, "模组"
+	a.project = engine.Project{ID: "example", Title: "Example"}
+	forge := engine.Instance{ID: "forge", Name: "旧存档", Version: "1.20.1", Loader: "forge"}
+	fabric := engine.Instance{ID: "fabric", Name: "生存世界", Version: "1.21.1", Loader: "fabric"}
+	a.instances = []engine.Instance{forge, fabric}
+	a.resourceTarget = fabric.ID
+	a.resourceGroups = []resourceGroup{
+		{key: loaderKey{forge.Version, forge.Loader}, files: []engine.ResourceVersion{{ID: "forge"}}},
+		{key: loaderKey{fabric.Version, fabric.Loader}, files: []engine.ResourceVersion{{ID: "fabric"}}},
+	}
+	test := ui.NewTester(a.view, 1020, 675)
+	first, firstFound := test.Find("Fabric 1.21.1（1）")
+	second, secondFound := test.Find("Forge 1.20.1（1）")
+	if !firstFound || !secondFound || first.Y >= second.Y || !test.HasText(fabric.Name) ||
+		test.HasText(fabric.Name+" · 1.21.1 · Fabric") {
+		t.Fatalf("expected name only and selected group first: %q", test.Texts())
+	}
+	if err := test.Click("安装目标实例"); err != nil {
+		t.Fatal(err)
+	}
+	if err := test.Click(forge.Name); err != nil {
+		t.Fatal(err)
+	}
+	first, firstFound = test.Find("Forge 1.20.1（1）")
+	second, secondFound = test.Find("Fabric 1.21.1（1）")
+	if !firstFound || !secondFound || first.Y >= second.Y || a.resourceTarget != forge.ID {
+		t.Fatalf("changing the target should reorder the groups: %q", test.Texts())
+	}
+}
+
 func TestMainNavigation(t *testing.T) {
 	a := newApp(engine.Engine{DataDir: t.TempDir()})
 	a.versionList = []engine.Version{{ID: "1.21.1", Type: "release"}}

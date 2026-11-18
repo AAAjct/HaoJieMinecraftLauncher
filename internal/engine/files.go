@@ -8,6 +8,7 @@ import (
 	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"os"
@@ -76,7 +77,16 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 	if err := os.MkdirAll(filepath.Dir(t.target), 0700); err != nil {
 		return err
 	}
-	var err error
+	cache, lock, err := t.lockResumeCache(ctx)
+	if err != nil {
+		return err
+	}
+	if lock != nil {
+		defer lock.Close()
+		if t.ready() {
+			return nil
+		}
+	}
 	sources := append([]string{t.URL}, t.Mirrors...)
 	for attempt := range 3 {
 		for _, source := range sources {
@@ -88,7 +98,11 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			if len(sources) > 1 && t.Size > 0 && t.Size <= 1<<20 {
 				downloadCtx, cancel = context.WithTimeout(ctx, 8*time.Second)
 			}
-			err = t.copyWithProgress(downloadCtx, progress)
+			if cache != "" {
+				err = t.copyResumable(downloadCtx, cache, progress)
+			} else {
+				err = t.copyWithProgress(downloadCtx, progress)
+			}
 			cancel()
 			if err == nil {
 				return nil
@@ -117,6 +131,21 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 		return err
 	}
 	defer res.Body.Close()
+	return t.saveTransfer(func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
+		return copyHTTP(ctx, t.URL, res, file, digest, limit, progress)
+	})
+}
+
+var errTransferHash = errors.New("文件哈希校验失败")
+
+func (t transfer) sizeLimit() int64 {
+	if t.Size > 0 {
+		return t.Size
+	}
+	return 512 << 20
+}
+
+func (t transfer) saveTransfer(write func(*os.File, hash.Hash, int64) (int64, error)) error {
 	file, err := os.CreateTemp(filepath.Dir(t.target), ".part-*")
 	if err != nil {
 		return err
@@ -124,12 +153,9 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 	defer os.Remove(file.Name())
 	defer file.Close()
 
-	limit := int64(512 << 20)
-	if t.Size > 0 {
-		limit = t.Size
-	}
+	limit := t.sizeLimit()
 	digest, expected := t.digest()
-	n, err := copyHTTP(ctx, t.URL, res, file, digest, limit, progress)
+	n, err := write(file, digest, limit)
 	if err != nil {
 		return err
 	}
@@ -137,7 +163,7 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 		return fmt.Errorf("文件大小校验失败")
 	}
 	if digest != nil && !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), expected) {
-		return fmt.Errorf("文件哈希校验失败")
+		return errTransferHash
 	}
 	if err := file.Close(); err != nil {
 		return err

@@ -339,7 +339,7 @@ func (a *app) resourceDetails(c *ui.Context) {
 		}
 	})
 	matched := false
-	for _, group := range a.resourceGroups {
+	for _, group := range recommendedGroups(a.resourceGroups, kind, target) {
 		if (a.fileGame != "" && group.key.game != a.fileGame) || (a.fileLoader != "" && group.key.loader != a.fileLoader) {
 			continue
 		}
@@ -386,6 +386,22 @@ func (a *app) resourceDetails(c *ui.Context) {
 	}
 }
 
+func recommendedGroups(groups []resourceGroup, kind string, target engine.Instance) []resourceGroup {
+	if target.ID == "" {
+		return groups
+	}
+	index := slices.IndexFunc(groups, func(group resourceGroup) bool {
+		return group.key.game == target.Version && (kind == "shader" || group.key.loader == target.Loader)
+	})
+	if index <= 0 {
+		return groups
+	}
+	ordered := make([]resourceGroup, 0, len(groups))
+	ordered = append(ordered, groups[index])
+	ordered = append(ordered, groups[:index]...)
+	return append(ordered, groups[index+1:]...)
+}
+
 func (a *app) fileDestination(kind string, group loaderKey, file engine.ResourceVersion, preferred engine.Instance) engine.Instance {
 	matches := func(i engine.Instance) bool {
 		return i.Version == group.game && (kind == "shader" || i.Loader == group.loader) &&
@@ -428,20 +444,35 @@ func (a *app) resourceDestination(c *ui.Context, kind string) engine.Instance {
 	}
 	ui.Row(c).Gap(8).Children(func() {
 		ui.Text(c, "安装到").FontSize(13)
-		var options []string
-		for _, i := range compatible {
-			name := i.Name + " · " + i.Version + " · " + loaderName(i)
-			if slices.Contains(options, name) {
-				name += " (" + i.ID + ")"
-			}
-			options = append(options, name)
+		selected := target.ID
+		control := ui.SelectBase(c, &selected)
+		trigger := control.Trigger.Label("安装目标实例").Grow(1).MinWidth(0).Height(36).Padding(4, 10).
+			Gap(8).AlignItems(ui.Center).Background(a.theme.Surface).Border(1, a.theme.Border).Radius(7)
+		if trigger.Hovered() {
+			trigger.Background(a.theme.SurfaceHover)
 		}
-		index := slices.IndexFunc(compatible, func(i engine.Instance) bool { return i.ID == target.ID })
-		selected := options[index]
-		if ui.Select(c, &selected, options).Label("安装目标实例").Grow(1).Changed() {
-			if index := slices.Index(options, selected); index >= 0 {
-				target = compatible[index]
-				a.resourceTarget = target.ID
+		trigger.Children(func() {
+			ui.Text(c, target.Name).Grow(1).MinWidth(0).MaxLines(1)
+			ui.Text(c, "⌄").TextColor(a.theme.TextMuted)
+		})
+		control.Popup(func(menu ui.Element) {
+			menu.Background(a.theme.Background).Border(1, a.theme.Border).Radius(7).Padding(4)
+			ui.Scroll(c).MaxHeight(260).Children(func() {
+				for _, i := range compatible {
+					item := control.Item(i.ID).Padding(6, 8).Radius(5)
+					if item.Hovered() {
+						item.Background(a.theme.SurfaceHover)
+					}
+					item.Children(func() { ui.Text(c, i.Name).MaxLines(1) })
+				}
+			})
+		})
+		if selected != target.ID {
+			for _, i := range compatible {
+				if i.ID == selected {
+					target, a.resourceTarget = i, i.ID
+					break
+				}
 			}
 		}
 	})

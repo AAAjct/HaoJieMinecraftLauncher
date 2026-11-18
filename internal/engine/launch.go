@@ -85,6 +85,7 @@ func expandArgs(raw []json.RawMessage, values *strings.Replacer) ([]string, erro
 }
 
 func (e Engine) Launch(ctx context.Context, instance Instance, account Account, memory int, status func(string)) (*Game, error) {
+	ctx = e.resumableDownloads(ctx)
 	if instance.legacy {
 		e.GameRoot = ""
 	}

@@ -58,6 +58,7 @@ type app struct {
 	modNames                                   *engine.ModNames
 	loadModNames                               func() *engine.ModNames
 	project                                    engine.Project
+	projectVersions                            map[string]projectVersionResult
 	resourceGroups                             []resourceGroup
 	openResourceGroups                         map[loaderKey]bool
 	fileGame, fileLoader, resourceTarget       string
@@ -88,6 +89,7 @@ type job struct {
 	message    string
 	cancel     context.CancelFunc
 	cancelling bool
+	superseded bool
 }
 
 func (a *app) busy(kind jobKind) bool { return a.jobs[kind] != nil }
@@ -225,7 +227,9 @@ func (a *app) start(kind jobKind, message string, work operation) {
 			switch kind {
 			case catalogJob:
 				if a.activeSearch != nil {
-					a.activeSearch.failed = err != nil
+					if !task.superseded {
+						a.activeSearch.failed = err != nil
+					}
 					a.activeSearch = nil
 				}
 			case downloadJob:
@@ -240,6 +244,9 @@ func (a *app) start(kind jobKind, message string, work operation) {
 				if len(a.jobs) == 0 {
 					a.window.Close()
 				}
+				return
+			}
+			if task.superseded {
 				return
 			}
 			if err != nil {
@@ -424,7 +431,15 @@ func (a *app) search(page int) {
 }
 
 func (a *app) submitResourceSearch(state *resourceSearch) {
-	state.submitted = strings.TrimSpace(state.query)
+	query := strings.TrimSpace(state.query)
+	if a.activeSearch == state && state.submitted == query {
+		return
+	}
+	if task := a.jobs[catalogJob]; a.activeSearch != nil && task != nil && !task.cancelling {
+		task.superseded = true
+		task.cancel()
+	}
+	state.submitted = query
 	state.results, state.page, state.total, state.loaded = nil, 0, 0, false
 	state.pending = true
 	a.search(0)
@@ -433,21 +448,39 @@ func (a *app) submitResourceSearch(state *resourceSearch) {
 func (a *app) loadProject(p engine.Project) {
 	kind := a.kind()
 	state := a.resourceSearches[kind]
+	show := func(list []engine.ResourceVersion) {
+		a.project, a.resourceGroups = p, groupResourceVersions(list, a.versionList)
+		a.fileGame, a.fileLoader = state.game, state.loader
+		a.resourceTarget = a.selected
+		clear(a.openResourceGroups)
+		a.pageChanged = time.Now()
+		a.mainScroll.Y = 0
+		a.status = "项目版本已加载。"
+	}
+	if cached, ok := a.projectVersions[p.ID]; ok && time.Since(cached.at) < 5*time.Minute {
+		show(cached.versions)
+		return
+	}
 	a.start(catalogJob, "正在读取项目版本…", func(ctx context.Context, _ func(string)) (func(), error) {
+		ctx, cancel := context.WithTimeout(ctx, 18*time.Second)
+		defer cancel()
 		list, err := engine.ResourceVersions(ctx, p.ID, kind, engine.Instance{})
 		return func() {
+			if a.projectVersions == nil || len(a.projectVersions) >= 24 {
+				a.projectVersions = make(map[string]projectVersionResult)
+			}
+			a.projectVersions[p.ID] = projectVersionResult{list, time.Now()}
 			if a.page != downloadsPage || a.kind() != kind {
 				return
 			}
-			a.project, a.resourceGroups = p, groupResourceVersions(list, a.versionList)
-			a.fileGame, a.fileLoader = state.game, state.loader
-			a.resourceTarget = a.selected
-			clear(a.openResourceGroups)
-			a.pageChanged = time.Now()
-			a.mainScroll.Y = 0
-			a.status = "项目版本已加载。"
+			show(list)
 		}, err
 	})
+}
+
+type projectVersionResult struct {
+	versions []engine.ResourceVersion
+	at       time.Time
 }
 
 func (a *app) installResource(v engine.ResourceVersion, i engine.Instance) {

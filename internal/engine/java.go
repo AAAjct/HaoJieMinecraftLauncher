@@ -45,6 +45,7 @@ func (e Engine) InstalledJava() []int {
 }
 
 func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) (string, error) {
+	ctx = e.resumableDownloads(ctx)
 	target := e.javaHome(major)
 	if isJDK(target) {
 		return target, nil

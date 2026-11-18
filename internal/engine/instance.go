@@ -112,6 +112,7 @@ func (e Engine) Install(ctx context.Context, instance Instance, status func(stri
 }
 
 func (e Engine) createInstance(ctx context.Context, instance Instance, setup func(string) error, status func(string)) (Instance, error) {
+	ctx = e.resumableDownloads(ctx)
 	if strings.TrimSpace(instance.Name) == "" {
 		instance.Name = instance.Version
 		if instance.Loader != "" {
