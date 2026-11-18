@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -220,8 +221,8 @@ func (a *app) instanceList(c *ui.Context) {
 			ui.Column(c).Gap(7).Children(func() {
 				for _, i := range a.instances {
 					label := i.Name
-					if a.running[i.ID] != nil {
-						label += " · 运行中"
+					if count := a.runningCount(i.ID); count > 0 {
+						label += " · 运行中 " + strconv.Itoa(count)
 					}
 					tooltip := i.Name + " · " + i.Version + " · " + loaderName(i)
 					button := ui.Button(c, label).Key(i.ID).Tooltip(tooltip).
@@ -248,7 +249,7 @@ func (a *app) launchSidebar(c *ui.Context) {
 	ui.Column(c).Grow(1).Padding(20).Gap(11).Children(func() {
 		ui.Spacer(c).Grow(1)
 		ui.Column(c).Gap(14).AlignItems(ui.Center).Children(func() {
-			ui.Image(c, steveAvatar).Size(64, 64).Label("史蒂夫头像")
+			a.playerAvatar(c)
 			before := a.nickname
 			input := ui.TextInput(c, &a.nickname).Label("离线玩家名").Width(172).TextAlign(ui.Center)
 			if before != a.nickname || input.Submitted() {
@@ -265,10 +266,10 @@ func (a *app) launchSidebar(c *ui.Context) {
 		} else {
 			ui.Text(c, i.Name).FontSize(14).Bold().MaxLines(2).TextAlign(ui.Center).Tooltip(i.Name)
 			label := "启动游戏"
-			if a.running[i.ID] != nil {
-				label = "游戏运行中"
+			if count := a.runningCount(i.ID); count > 0 {
+				label = "再次启动（运行中 " + strconv.Itoa(count) + "）"
 			}
-			if ui.PrimaryButton(c, label).Height(44).Disabled(a.inUse(i) || a.busy(launchJob)).Clicked() {
+			if ui.PrimaryButton(c, label).Height(44).Disabled(a.installInProgress(i) || a.busy(launchJob)).Clicked() {
 				a.play(i)
 			}
 		}

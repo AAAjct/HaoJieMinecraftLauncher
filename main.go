@@ -39,8 +39,10 @@ type app struct {
 	deleteConfirm bool
 	modFilter     string
 	renameValue   string
-	running       map[string]*engine.Game
+	running       map[*engine.Game]string
 	stopLaunch    bool
+	skinAvatar    ui.ImageSource
+	alexLoading   bool
 
 	versionList                                []engine.Version
 	versionStamp                               time.Time
@@ -133,13 +135,27 @@ func (a *app) downloading(key, target string) bool {
 }
 
 func (a *app) gameInUse(i engine.Instance) bool {
-	return i.ID != "" && (a.running[i.ID] != nil || a.launchTarget == i.ID)
+	return i.ID != "" && (a.runningCount(i.ID) > 0 || a.launchTarget == i.ID)
 }
 
 func (a *app) inUse(i engine.Instance) bool {
-	return i.ID != "" && (a.gameInUse(i) || slices.ContainsFunc(a.jobs, func(task *job) bool {
+	return a.gameInUse(i) || a.installInProgress(i)
+}
+
+func (a *app) installInProgress(i engine.Instance) bool {
+	return i.ID != "" && slices.ContainsFunc(a.jobs, func(task *job) bool {
 		return task.target == i.ID
-	}))
+	})
+}
+
+func (a *app) runningCount(id string) int {
+	count := 0
+	for _, instanceID := range a.running {
+		if instanceID == id {
+			count++
+		}
+	}
+	return count
 }
 
 func (a *app) navigate(page string) {
@@ -177,7 +193,7 @@ func newApp(core engine.Engine) *app {
 	a := &app{
 		engine: core, theme: theme, page: launchPage, settings: s,
 		nickname: s.Nickname, selected: s.Instance,
-		running: map[string]*engine.Game{}, resourceKind: "游戏版本",
+		running: map[*engine.Game]string{}, resourceKind: "游戏版本",
 		status:        "就绪",
 		versionGroups: map[string]bool{},
 		openLoaders:   map[string]bool{}, loaderLists: map[loaderKey][]engine.LoaderBuild{},
@@ -213,6 +229,7 @@ func (a *app) refreshInstances() {
 	}
 	a.renameValue = a.current().Name
 	a.refreshMods()
+	a.refreshSkinAvatar()
 }
 
 func (a *app) refreshMods() {
@@ -249,6 +266,7 @@ func (a *app) selectInstance(i engine.Instance) {
 	}
 	a.modFilter = ""
 	a.refreshMods()
+	a.refreshSkinAvatar()
 	a.preloadBuilds(i.Version)
 }
 
@@ -347,7 +365,7 @@ func versionDownloadKey(i engine.Instance) string {
 }
 
 func (a *app) play(i engine.Instance) {
-	if a.inUse(i) || a.busy(launchJob) {
+	if i.ID == "" || a.installInProgress(i) || a.busy(launchJob) || a.closing || a.window == nil {
 		return
 	}
 	account, err := engine.LocalAccount(strings.TrimSpace(a.nickname))
@@ -356,8 +374,12 @@ func (a *app) play(i engine.Instance) {
 		return
 	}
 	reserved := 0
-	for _, game := range a.running {
+	for game := range a.running {
 		reserved += game.Memory
+	}
+	options := engine.LaunchOptions{
+		Additional: a.runningCount(i.ID) > 0,
+		Skin:       a.settings.Skin, SkinPNG: a.settings.SkinPNG,
 	}
 	a.stopLaunch = false
 	a.launchTarget = i.ID
@@ -366,13 +388,14 @@ func (a *app) play(i engine.Instance) {
 		if err != nil {
 			return nil, err
 		}
-		game, err := a.engine.Launch(ctx, i, account, memory, status)
+		options.Memory = memory
+		game, err := a.engine.Launch(ctx, i, account, options, status)
 		return func() {
 			if a.closing {
 				_ = game.Stop()
 				return
 			}
-			a.running[i.ID] = game
+			a.running[game] = i.ID
 			a.status = fmt.Sprintf("Minecraft 已启动 · %s · 分配 %d MiB", i.Name, memory)
 			if a.stopLaunch {
 				a.stopGames()
@@ -380,13 +403,13 @@ func (a *app) play(i engine.Instance) {
 			go func() {
 				err := <-game.Done
 				a.window.Update(func() {
-					delete(a.running, i.ID)
+					delete(a.running, game)
 					if !a.busy(launchJob) {
 						a.status = "游戏已退出 · " + i.Name
 						if game.Stopping {
 							a.status = "已结束 Minecraft · " + i.Name
 						} else if err != nil {
-							a.status = "游戏异常退出，请在游戏目录查看 hjml-latest.log。"
+							a.status = "游戏异常退出，请在游戏目录查看 " + filepath.Base(game.LogPath) + "。"
 						}
 					}
 				})
@@ -403,7 +426,7 @@ func (a *app) stopGames() {
 		task.cancel()
 	}
 	a.status = "正在结束 Minecraft 实例…"
-	for _, game := range a.running {
+	for game := range a.running {
 		if !game.Stopping {
 			if err := game.Stop(); err != nil {
 				a.status = "结束 Minecraft 失败：" + err.Error()
@@ -687,6 +710,7 @@ func main() {
 		})
 		removeWindowBorder(a.window)
 		a.window.OnClosed(stopCatalog)
+		a.refreshSkinAvatar()
 		go func() {
 			names := a.loadModNames()
 			if catalogCtx.Err() == nil {

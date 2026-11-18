@@ -2,10 +2,14 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -43,7 +47,7 @@ func TestLongVersionListAndFloatingActions(t *testing.T) {
 	if a.mainScroll.Y != 0 {
 		t.Fatalf("back-to-top left the list at %v", a.mainScroll.Y)
 	}
-	a.running["first"] = &engine.Game{}
+	a.running[&engine.Game{Memory: 2048}] = "first"
 	test.Frame()
 	stop, hasStop := test.Find("结束所有 Minecraft 实例")
 	top, hasTop := test.Find("回到顶部")
@@ -281,7 +285,7 @@ func TestInstallTargetsMatchFileGroup(t *testing.T) {
 	if dest := a.fileDestination("mod", group, file, fabric); dest.ID != forge.ID {
 		t.Fatalf("compatible Forge file should be installable from a Fabric selection: %+v", dest)
 	}
-	a.running[forge.ID] = &engine.Game{}
+	a.running[&engine.Game{Memory: 2048}] = forge.ID
 	if dest := a.fileDestination("mod", group, file, fabric); dest.ID != "" {
 		t.Fatalf("should not install into a running instance: %+v", dest)
 	}
@@ -444,6 +448,68 @@ func TestLaunchPageDirectNicknameAndInstance(t *testing.T) {
 	test.Type("Steve_New")
 	if got := core.LoadSettings().Nickname; got != "Steve_New" {
 		t.Fatalf("direct nickname edit did not persist: %q", got)
+	}
+}
+
+func TestAvatarContextMenuSavesSkinAndShowsRunningCount(t *testing.T) {
+	core := engine.Engine{DataDir: t.TempDir()}
+	a := newApp(core)
+	a.selected = "fabric"
+	a.instances = []engine.Instance{{ID: "fabric", Name: "生存世界"}}
+	first, second := &engine.Game{Memory: 2048}, &engine.Game{Memory: 2048}
+	a.running[first], a.running[second] = "fabric", "fabric"
+	test := ui.NewTester(a.view, 1020, 675)
+	if !test.HasText("再次启动（运行中 2）") || a.installInProgress(a.current()) {
+		t.Fatal("running games should be counted separately and allow another launch")
+	}
+	delete(a.running, first)
+	test.Frame()
+	if !test.HasText("再次启动（运行中 1）") || !a.gameInUse(a.current()) {
+		t.Fatal("one game's exit should leave the other running")
+	}
+	if err := test.RightClick("史蒂夫头像"); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []string{"史蒂夫", "艾利克斯", "本地皮肤"} {
+		if !slices.Contains(test.Menu(), item) {
+			t.Fatalf("missing %s in avatar menu: %v", item, test.Menu())
+		}
+	}
+	if err := test.ChooseMenuItem("艾利克斯"); err != nil {
+		t.Fatal(err)
+	}
+	if core.LoadSettings().Skin != engine.AlexSkin {
+		t.Fatal("avatar menu did not save the selected skin")
+	}
+	test.Frame()
+	avatar, found := test.Find("艾利克斯头像")
+	if !found {
+		t.Fatal("blank avatar should still be available for right-click")
+	}
+	frame := test.Image()
+	x, y := int(avatar.X), int(avatar.Y)
+	background := frame.RGBAAt(x, y)
+	for dy := range int(avatar.H) {
+		for dx := range int(avatar.W) {
+			if frame.RGBAAt(x+dx, y+dy) != background {
+				t.Fatal("an unloaded avatar should be visually blank")
+			}
+		}
+	}
+	var skin bytes.Buffer
+	if err := png.Encode(&skin, image.NewNRGBA(image.Rect(0, 0, 64, 64))); err != nil {
+		t.Fatal(err)
+	}
+	next := a.settings
+	next.Skin, next.SkinPNG, next.SkinFilename = engine.LocalSkin, skin.Bytes(), "自制皮肤.v2.PNG"
+	a.saveSkin(next)
+	a = newApp(core)
+	test = ui.NewTester(a.view, 1020, 675)
+	if err := test.RightClick("本地皮肤头像"); err != nil {
+		t.Fatal(err)
+	}
+	if items := test.Menu(); !slices.Contains(items, "自制皮肤.v2") || slices.Contains(items, "自制皮肤.v2.PNG") {
+		t.Fatalf("imported filename should appear without the extension after restart: %v", items)
 	}
 }
 

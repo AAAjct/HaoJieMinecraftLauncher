@@ -6,8 +6,11 @@ import (
 )
 
 type Settings struct {
-	Nickname string
-	Instance string
+	Nickname     string
+	Instance     string
+	Skin         string `json:",omitempty"`
+	SkinPNG      []byte `json:",omitempty"`
+	SkinFilename string `json:",omitempty"`
 }
 
 func (e Engine) LoadSettings() Settings {

@@ -84,7 +84,15 @@ func expandArgs(raw []json.RawMessage, values *strings.Replacer) ([]string, erro
 	return args, nil
 }
 
-func (e Engine) Launch(ctx context.Context, instance Instance, account Account, memory int, status func(string)) (*Game, error) {
+type LaunchOptions struct {
+	Memory     int
+	Additional bool
+	Skin       string
+	SkinPNG    []byte
+}
+
+func (e Engine) Launch(ctx context.Context, instance Instance, account Account, options LaunchOptions, status func(string)) (*Game, error) {
+	memory := options.Memory
 	lock := e.versionLock(instance)
 	lock.RLock()
 	defer lock.RUnlock()
@@ -117,15 +125,35 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if err := ensureAll(ctx, append(files, assetFiles...), "检查客户端文件和资源", status); err != nil {
 		return nil, err
 	}
-	game := e.GameDir(instance)
-	if _, err := os.Stat(game); err != nil {
+	instanceDir := e.GameDir(instance)
+	if _, err := os.Stat(instanceDir); err != nil {
 		return nil, err
+	}
+	game := instanceDir
+	started := false
+	var session *gameSession
+	if options.Additional {
+		session, err = startGameSession(instanceDir)
+		if err != nil {
+			return nil, err
+		}
+		game = session.dir
+		defer func() {
+			if !started {
+				session.close()
+			}
+		}()
+	}
+	if options.Skin != "" {
+		status("正在应用离线玩家皮肤…")
+		if err := applyPlayerSkin(e.baseVersionFile(instance.Version, ".jar"), game, account, options); err != nil {
+			return nil, err
+		}
 	}
 	native, err := os.MkdirTemp(game, ".natives-")
 	if err != nil {
 		return nil, err
 	}
-	started := false
 	defer func() {
 		if !started {
 			os.RemoveAll(native)
@@ -186,8 +214,12 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	logPath := filepath.Join(game, "hjml-latest.log")
-	log, err := os.Create(logPath)
+	var log *os.File
+	if options.Additional {
+		log, err = os.CreateTemp(instanceDir, "hjml-launch-*.log")
+	} else {
+		log, err = os.Create(filepath.Join(game, "hjml-latest.log"))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -206,10 +238,13 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		err := cmd.Wait()
 		log.Close()
 		os.RemoveAll(native)
+		if session != nil {
+			session.close()
+		}
 		done <- err
 		close(done)
 	}()
-	return &Game{Done: done, LogPath: logPath, Memory: memory, process: cmd.Process}, nil
+	return &Game{Done: done, LogPath: log.Name(), Memory: memory, process: cmd.Process}, nil
 }
 
 const windowsNoConsole = 0x08000000

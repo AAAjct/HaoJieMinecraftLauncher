@@ -139,7 +139,7 @@ func TestMinecraftLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	game, err := e.Launch(t.Context(), instance, account, 2048, status)
+	game, err := e.Launch(t.Context(), instance, account, LaunchOptions{Memory: 2048}, status)
 	if err != nil {
 		t.Fatal(err)
 	}
