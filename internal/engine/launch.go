@@ -1,0 +1,285 @@
+package engine
+
+import (
+	"archive/zip"
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+)
+
+type Account struct {
+	Name, UUID string
+}
+
+type Game struct {
+	Done     <-chan error
+	LogPath  string
+	Memory   int
+	process  *os.Process
+	Stopping bool
+}
+
+func (g *Game) Stop() error {
+	err := g.process.Kill()
+	if err == nil || errors.Is(err, os.ErrProcessDone) {
+		g.Stopping = true
+		return nil
+	}
+	return err
+}
+
+var playerName = regexp.MustCompile(`^[A-Za-z0-9_]{3,16}$`)
+
+func LocalAccount(name string) (Account, error) {
+	if !playerName.MatchString(name) {
+		return Account{}, fmt.Errorf("本地玩家名需为 3–16 位字母、数字或下划线")
+	}
+	hash := md5.Sum([]byte("OfflinePlayer:" + name))
+	hash[6] = hash[6]&0x0f | 0x30
+	hash[8] = hash[8]&0x3f | 0x80
+	return Account{Name: name, UUID: hex.EncodeToString(hash[:])}, nil
+}
+
+func expandArgs(raw []json.RawMessage, values *strings.Replacer) ([]string, error) {
+	var args []string
+	for _, entry := range raw {
+		var single string
+		if json.Unmarshal(entry, &single) == nil {
+			args = append(args, values.Replace(single))
+			continue
+		}
+		var conditional struct {
+			Rules []restriction
+			Value json.RawMessage
+		}
+		if err := json.Unmarshal(entry, &conditional); err != nil {
+			return nil, err
+		}
+		if !permitted(conditional.Rules, nil) {
+			continue
+		}
+		if json.Unmarshal(conditional.Value, &single) == nil {
+			args = append(args, values.Replace(single))
+			continue
+		}
+		var array []string
+		if err := json.Unmarshal(conditional.Value, &array); err != nil {
+			return nil, err
+		}
+		for _, arg := range array {
+			args = append(args, values.Replace(arg))
+		}
+	}
+	return args, nil
+}
+
+func (e Engine) Launch(ctx context.Context, instance Instance, account Account, memory int, status func(string)) (*Game, error) {
+	if instance.legacy {
+		e.GameRoot = ""
+	}
+	if account.Name == "" || account.UUID == "" {
+		return nil, fmt.Errorf("请先设置玩家账号")
+	}
+	if memory < 1024 || memory > 32768 {
+		return nil, fmt.Errorf("内存上限须为 1024–32768 MiB")
+	}
+	profile, err := e.profile(ctx, instance, status)
+	if err != nil {
+		return nil, err
+	}
+	javaHome, err := e.EnsureJava(ctx, profile.JavaVersion.MajorVersion, status)
+	if err != nil {
+		return nil, err
+	}
+	files, classpath, archives, err := e.gameTransfers(profile)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureAll(ctx, files, "检查客户端文件", status); err != nil {
+		return nil, err
+	}
+	if err := e.ensureAssets(ctx, profile, status); err != nil {
+		return nil, err
+	}
+	game := e.GameDir(instance)
+	if _, err := os.Stat(game); err != nil {
+		return nil, err
+	}
+	native, err := os.MkdirTemp(game, ".natives-")
+	if err != nil {
+		return nil, err
+	}
+	started := false
+	defer func() {
+		if !started {
+			os.RemoveAll(native)
+		}
+	}()
+	for _, archive := range archives {
+		if err := extractNatives(archive, native); err != nil {
+			return nil, err
+		}
+	}
+
+	assets := filepath.Join(e.gameRoot(), "assets")
+	gameAssets, err := legacyAssets(assets, game, profile.AssetIndex.ID)
+	if err != nil {
+		return nil, err
+	}
+	versionName := instance.Version
+	if profile.LaunchID != "" {
+		versionName = profile.LaunchID
+	}
+	values := strings.NewReplacer(
+		"${auth_player_name}", account.Name, "${auth_uuid}", account.UUID,
+		"${auth_access_token}", "0", "${auth_session}", "0",
+		"${auth_client_id}", "", "${clientid}", "", "${auth_xuid}", "",
+		"${user_type}", "legacy", "${user_properties}", "{}",
+		"${version_name}", versionName, "${version_type}", "HJML",
+		"${game_directory}", game, "${assets_root}", assets, "${game_assets}", gameAssets,
+		"${assets_index_name}", profile.AssetIndex.ID, "${natives_directory}", native,
+		"${launcher_name}", "HJML", "${launcher_version}", "1.0.0",
+		"${library_directory}", filepath.Join(e.gameRoot(), "libraries"), "${classpath_separator}", ";",
+		"${classpath}", strings.Join(classpath, ";"),
+	)
+	jvmArgs, err := expandArgs(profile.Arguments.JVM, values)
+	if err != nil {
+		return nil, err
+	}
+	if len(jvmArgs) == 0 {
+		jvmArgs = []string{"-Djava.library.path=" + native, "-cp", strings.Join(classpath, ";")}
+	}
+	if file := profile.Logging.Client.File; file.ID != "" && profile.Logging.Client.Argument != "" {
+		jvmArgs = append(jvmArgs, strings.ReplaceAll(profile.Logging.Client.Argument, "${path}",
+			filepath.Join(assets, "log_configs", file.ID)))
+	}
+	gameArgs, err := expandArgs(profile.Arguments.Game, values)
+	if err != nil {
+		return nil, err
+	}
+	if profile.MinecraftArguments != "" {
+		old := strings.Fields(profile.MinecraftArguments)
+		for i := range old {
+			old[i] = values.Replace(old[i])
+		}
+		gameArgs = append(old, gameArgs...)
+	}
+	args := append([]string{"-Xmx" + strconv.Itoa(memory) + "M"}, jvmArgs...)
+	args = append(args, profile.MainClass)
+	args = append(args, gameArgs...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(game, "hjml-latest.log")
+	log, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(filepath.Join(javaHome, "bin", "java.exe"), args...)
+	cmd.Dir = game
+	cmd.Stdout, cmd.Stderr = log, log
+	cmd.Env = append(os.Environ(), "JAVA_HOME="+javaHome)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windowsNoConsole}
+	if err := cmd.Start(); err != nil {
+		log.Close()
+		return nil, err
+	}
+	started = true
+	done := make(chan error, 1)
+	go func() {
+		err := cmd.Wait()
+		log.Close()
+		os.RemoveAll(native)
+		done <- err
+		close(done)
+	}()
+	return &Game{Done: done, LogPath: logPath, Memory: memory, process: cmd.Process}, nil
+}
+
+const windowsNoConsole = 0x08000000
+
+func extractNatives(archive, directory string) error {
+	z, err := zip.OpenReader(archive)
+	if err != nil {
+		return err
+	}
+	defer z.Close()
+	for _, entry := range z.File {
+		if !strings.HasSuffix(strings.ToLower(entry.Name), ".dll") || !entry.Mode().IsRegular() {
+			continue
+		}
+		name := filepath.Base(entry.Name)
+		if !segment(name) {
+			return fmt.Errorf("无效 Windows 原生库")
+		}
+		if err := writeZipEntry(entry, filepath.Join(directory, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeZipEntry(entry *zip.File, target string) error {
+	if !entry.Mode().IsRegular() || entry.UncompressedSize64 > 512<<20 {
+		return fmt.Errorf("不支持的压缩条目 %s", entry.Name)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		return err
+	}
+	source, err := entry.Open()
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	output, err := os.Create(target)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(output, source)
+	closeErr := output.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func legacyAssets(root, game, id string) (string, error) {
+	var index assetIndex
+	if err := readJSON(filepath.Join(root, "indexes", id+".json"), &index); err != nil {
+		return "", err
+	}
+	if !index.Virtual && !index.MapToResources {
+		return root, nil
+	}
+	target := filepath.Join(root, "virtual", id)
+	if index.MapToResources {
+		target = filepath.Join(game, "resources")
+	}
+	for name, entry := range index.Objects {
+		path, err := localPath(target, name)
+		if err != nil || !validAssetHash(entry.Hash) {
+			return "", fmt.Errorf("无效旧版资源索引")
+		}
+		if regularFile(path) {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+			return "", err
+		}
+		if err := os.Link(filepath.Join(root, "objects", entry.Hash[:2], entry.Hash), path); err != nil && !regularFile(path) {
+			return "", err
+		}
+	}
+	return target, nil
+}

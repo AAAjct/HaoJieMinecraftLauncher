@@ -1,0 +1,4 @@
+/dist/
+/.minecraft/
+/runtime-helper/target/
+/internal/engine/bin/*.exe

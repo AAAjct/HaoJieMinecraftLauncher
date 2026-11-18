@@ -1,0 +1,389 @@
+package main
+
+import (
+	_ "embed"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/egoist/mygo/ui"
+	"hjml/internal/engine"
+)
+
+//go:embed steve.png
+var stevePNG []byte
+
+var steveAvatar, _ = ui.DecodeImage(stevePNG)
+
+var (
+	white       = ui.Hex("#F5FAFF")
+	blue        = ui.Hex("#246BBB")
+	highlight   = ui.Hex("#93CEFF")
+	line        = ui.Hex("#334459")
+	scrollToTop = ui.Animation{Duration: 260 * time.Millisecond}
+)
+
+func panel(c *ui.Context) ui.Element {
+	return ui.Column(c).Background(ui.Hex("#1A2635")).Border(1, line).Radius(10).Padding(16).Gap(10)
+}
+
+func (a *app) view(c *ui.Context) {
+	c.SetTheme(a.theme)
+	ui.Column(c).Fill().Background(a.theme.Background).Children(func() {
+		ui.Row(c).Height(58).Padding(0, 10, 0, 20).Gap(10).Background(blue).Children(func() {
+			ui.Text(c, "HJML").FontSize(21).Bold().TextColor(white).DragWindow()
+			ui.Spacer(c).Grow(1).Height(48).DragWindow()
+			for _, label := range []string{launchPage, downloadsPage, managePage, tasksPage} {
+				button := ui.ButtonBase(c).Label(label).Center().Width(86).Height(38).Radius(7)
+				if button.Hovered() {
+					button.Background(ui.Hex("#3980CF"))
+				}
+				if a.page == label {
+					button.DrawOver(func(p *ui.Painter, r ui.Rect) {
+						p.Fill(ui.Rect{X: r.X + r.W/2 - 12, Y: r.Y + r.H - 2, W: 24, H: 2}, white, 1)
+					})
+				}
+				button.Children(func() { ui.Text(c, label).FontSize(15).Bold().TextColor(white) })
+				if button.Clicked() {
+					a.navigate(label)
+					if label == downloadsPage && a.resourceKind == "游戏版本" {
+						a.downloadVersions(false)
+					}
+				}
+			}
+			ui.Spacer(c).Grow(1).Height(48).DragWindow()
+			if a.window != nil {
+				a.windowButtons(c)
+			}
+		})
+		ui.Row(c).Grow(1).AlignItems(ui.Stretch).Children(func() {
+			if a.page == launchPage {
+				a.animatePage(c, ui.Column(c).Shrink(0)).Children(func() { a.launchSidebar(c) })
+			} else if a.page == downloadsPage {
+				a.downloadSidebar(c)
+			} else if a.page == tasksPage {
+				a.taskSidebar(c)
+			} else {
+				a.instanceList(c)
+			}
+			scrollKey := a.page
+			if a.page == downloadsPage {
+				scrollKey += a.resourceKind + a.project.ID + a.targetVersion
+			}
+			ui.Column(c).Grow(1).Children(func() {
+				if a.page != launchPage {
+					ui.Scroll(c).Key(scrollKey).TrackScroll(&a.mainScroll).Grow(1).Padding(18, 62, 18, 18).Children(func() {
+						a.animatePage(c, ui.Column(c).Gap(12)).Children(func() {
+							switch a.page {
+							case downloadsPage:
+								a.downloadView(c)
+							case managePage:
+								a.manageView(c)
+							case tasksPage:
+								a.taskView(c)
+							}
+						})
+					})
+				}
+				if len(a.running) > 0 {
+					if circleButton(c, "结束所有 Minecraft 实例", "×").Absolute().Bottom(16).Right(14).Clicked() {
+						a.stopGames()
+					}
+				}
+				if a.page != launchPage && a.mainScroll.MaxY > 1 {
+					button := circleButton(c, "回到顶部", "↑").Absolute().Right(14)
+					if len(a.running) > 0 {
+						button.Bottom(62)
+					} else {
+						button.Bottom(16)
+					}
+					if button.Clicked() {
+						a.mainScroll.ScrollTo(0, 0, scrollToTop)
+					}
+				}
+			})
+		})
+		if a.page == downloadsPage && a.resourceKind == "游戏版本" && a.targetVersion != "" && a.hasVersion() {
+			a.installVersionBar(c)
+		}
+		ui.Divider(c)
+		ui.Column(c).Background(ui.Hex("#182333")).Children(func() {
+			for _, kind := range []jobKind{downloadJob, launchJob, catalogJob} {
+				task := a.jobs[kind]
+				if task == nil {
+					continue
+				}
+				ui.Row(c).AlignItems(ui.Center).Padding(5, 16, 0, 16).Gap(9).Children(func() {
+					ui.Progress(c, -1).Width(66).Height(4).Label(string(kind) + "进度")
+					ui.Text(c, task.message).Grow(1).MaxLines(1).FontSize(12).TextColor(a.theme.TextMuted).Tooltip(task.message)
+					if ui.Button(c, "取消"+string(kind)).Disabled(task.cancelling).Clicked() {
+						task.cancelling = true
+						task.message = "正在取消并清理临时文件…"
+						task.cancel()
+					}
+				})
+			}
+			ui.Row(c).MinHeight(36).Padding(4, 16).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, a.status).Grow(1).MaxLines(2).FontSize(12).TextColor(a.theme.TextMuted).Tooltip(a.status)
+			})
+		})
+		a.importDialog(c)
+	})
+}
+
+func (a *app) animatePage(c *ui.Context, body ui.Element) ui.Element {
+	if !a.pageChanged.IsZero() && !c.Preferences().ReduceMotion {
+		progress := float32(time.Since(a.pageChanged)) / float32(320*time.Millisecond)
+		if progress >= 0 && progress < 1 {
+			c.AnimationFrame()
+			left := 1 - progress
+			scale := 1 - 0.055*left*left*float32(math.Cos(float64(progress)*7))
+			body.Opacity(0.65+0.35*ui.EaseOut(progress)).Scale(scale, scale).TransformOrigin(0.5, 0.5)
+		}
+	}
+	return body
+}
+
+func circleButton(c *ui.Context, label, symbol string) ui.Element {
+	button := ui.ButtonBase(c).Label(label).Tooltip(label).Size(36, 36).Center().Radius(18).
+		Border(1, line).Background(c.Theme().Surface)
+	if button.Hovered() {
+		button.Background(c.Theme().SurfaceHover)
+	}
+	button.Children(func() { ui.Text(c, symbol).FontSize(21).TextColor(white) })
+	return button
+}
+
+func (a *app) windowButtons(c *ui.Context) {
+	maximize := "最大化"
+	if a.window.IsMaximized() {
+		maximize = "还原窗口"
+	}
+	for _, action := range []struct {
+		label, symbol string
+		click         func()
+	}{
+		{"最小化", "−", a.window.Minimize},
+		{maximize, "□", a.window.ToggleMaximize},
+		{"关闭窗口", "×", a.window.Close},
+	} {
+		button := ui.ButtonBase(c).Label(action.label).Tooltip(action.label).Center().Width(34).Height(34).Radius(6)
+		if button.Hovered() {
+			button.Background(ui.Hex("#3980CF"))
+		}
+		button.Children(func() { ui.Text(c, action.symbol).FontSize(17).TextColor(white) })
+		if button.Clicked() {
+			action.click()
+		}
+	}
+}
+
+func (a *app) instanceList(c *ui.Context) {
+	a.animatePage(c, ui.Column(c).Width(218).Shrink(0).Background(ui.Hex("#202836")).Padding(15).Gap(9)).Children(func() {
+		ui.Row(c).Children(func() {
+			ui.Text(c, "我的实例").FontSize(16).Bold()
+			ui.Spacer(c).Grow(1)
+			if ui.Button(c, "刷新").Label("刷新实例列表").Clicked() {
+				a.refreshInstances()
+			}
+		})
+		if len(a.instances) == 0 {
+			ui.Text(c, "安装游戏版本或导入整合包后，实例会出现在这里。").
+				FontSize(13).TextColor(a.theme.TextMuted)
+			return
+		}
+		ui.Scroll(c).TrackScroll(&a.instanceScroll).Grow(1).Children(func() {
+			ui.Column(c).Gap(7).Children(func() {
+				for _, i := range a.instances {
+					label := i.Name
+					if a.running[i.ID] != nil {
+						label += " · 运行中"
+					}
+					tooltip := i.Name + " · " + i.Version + " · " + loaderName(i)
+					if i.ID == a.selected {
+						tooltip = "再次点击以修改实例名"
+					}
+					button := ui.Button(c, label).Key(i.ID).Tooltip(tooltip).
+						Height(38).MaxLines(1)
+					if i.ID == a.selected {
+						button.TextColor(highlight).Bold()
+					}
+					if button.Clicked() {
+						if i.ID == a.selected {
+							a.renaming, a.renameValue = i.ID, i.Name
+						} else {
+							a.selectInstance(i)
+						}
+					}
+				}
+			})
+		})
+		if a.instanceScroll.MaxY > 1 {
+			if circleButton(c, "回到实例列表顶部", "↑").AlignSelf(ui.End).Clicked() {
+				a.instanceScroll.ScrollTo(0, 0, scrollToTop)
+			}
+		}
+	})
+}
+
+func (a *app) launchSidebar(c *ui.Context) {
+	i := a.current()
+	ui.Column(c).Width(278).Grow(1).Padding(20).Gap(11).Background(ui.Hex("#202631")).Children(func() {
+		ui.Spacer(c).Grow(1)
+		ui.Column(c).Gap(14).AlignItems(ui.Center).Children(func() {
+			ui.Image(c, steveAvatar).Size(64, 64).Label("史蒂夫头像")
+			before := a.nickname
+			input := ui.TextInput(c, &a.nickname).Label("离线玩家名").Width(172).TextAlign(ui.Center)
+			if before != a.nickname || input.Submitted() {
+				a.saveNickname()
+			}
+			ui.Text(c, "离线玩家").FontSize(13).TextColor(a.theme.TextMuted)
+		})
+		ui.Spacer(c).Grow(1)
+		if i.ID == "" {
+			ui.Text(c, "未选择实例").FontSize(13).TextColor(a.theme.TextMuted).TextAlign(ui.Center)
+			if ui.PrimaryButton(c, "下载游戏").Height(44).Clicked() {
+				a.openVersions()
+			}
+		} else {
+			ui.Text(c, i.Name).FontSize(14).Bold().MaxLines(2).TextAlign(ui.Center).Tooltip(i.Name)
+			label := "启动游戏"
+			if a.running[i.ID] != nil {
+				label = "游戏运行中"
+			}
+			if ui.PrimaryButton(c, label).Height(44).Disabled(a.inUse(i) || a.busy(launchJob)).Clicked() {
+				a.play(i)
+			}
+		}
+		if ui.Button(c, "实例管理").Height(36).Clicked() {
+			a.navigate(managePage)
+		}
+	})
+}
+
+func (a *app) manageView(c *ui.Context) {
+	i := a.current()
+	panel(c).Children(func() {
+		ui.Text(c, "实例管理").FontSize(21).Bold()
+		if i.ID == "" {
+			ui.Text(c, "安装实例后可在此管理模组。").TextColor(a.theme.TextMuted)
+			return
+		}
+		if a.renaming == i.ID {
+			a.renameInstanceView(c, i)
+		} else {
+			ui.Textf(c, "%s - [%s · %s]", i.Name, i.Version, loaderName(i)).Bold()
+		}
+		folder := a.engine.GameDir(i)
+		ui.Row(c).Gap(8).Children(func() {
+			if ui.Button(c, "打开游戏目录").Clicked() {
+				a.openFile(folder)
+			}
+			if ui.Button(c, "打开模组目录").Clicked() {
+				mods := filepath.Join(folder, "mods")
+				if err := os.Mkdir(mods, 0700); err != nil && !os.IsExist(err) {
+					a.status = err.Error()
+				} else {
+					a.openFile(mods)
+				}
+			}
+			if ui.Button(c, "刷新").Label("刷新实例与模组").Clicked() {
+				a.refreshInstances()
+			}
+			if ui.Button(c, "从文件安装").Disabled(a.busy(downloadJob) || a.inUse(i)).Clicked() {
+				a.chooseFiles()
+			}
+		})
+	})
+	if i.ID == "" {
+		return
+	}
+	busy := a.inUse(i)
+	panel(c).Children(func() {
+		ui.Textf(c, "模组 · %d", len(a.mods)).FontSize(17).Bold()
+		if len(a.mods) > 0 {
+			input := ui.TextInput(c, &a.modFilter).Label("搜索本地模组").Placeholder("搜索模组名称或文件名")
+			if input.Submitted() {
+				a.mainScroll.Y = 0
+			}
+		}
+		if len(a.mods) == 0 {
+			ui.Text(c, "该实例还没有本地模组。").TextColor(a.theme.TextMuted)
+		}
+		for _, mod := range a.mods {
+			name := mod.Name
+			if name == "" {
+				name = strings.TrimSuffix(mod.Filename, ".disabled")
+			}
+			name = bilingualName(name, mod.ID)
+			if !matchesSearch(name+" "+mod.Filename, a.modFilter) {
+				continue
+			}
+			ui.Divider(c)
+			ui.Row(c).Gap(8).Children(func() {
+				ui.Text(c, name).Grow(1).MaxLines(1).Tooltip(mod.Filename)
+				label := "禁用"
+				if !mod.Enabled {
+					label = "启用"
+					ui.Text(c, "已禁用").TextColor(a.theme.TextMuted).FontSize(12)
+				}
+				if ui.Button(c, label).Disabled(busy).Clicked() {
+					if err := a.engine.ToggleMod(i, mod); err != nil {
+						a.status = err.Error()
+					} else {
+						a.status = label + "模组成功。"
+						a.refreshMods()
+					}
+				}
+				if a.DeleteTarget == mod.Filename {
+					if ui.Button(c, "取消").Clicked() {
+						a.DeleteTarget = ""
+					}
+					if ui.Button(c, "确认删除").Disabled(busy).Clicked() {
+						if err := a.engine.RemoveMod(i, mod); err != nil {
+							a.status = err.Error()
+						} else {
+							a.status = "模组已删除。"
+							a.refreshMods()
+						}
+						a.DeleteTarget = ""
+					}
+				} else if ui.Button(c, "删除").Disabled(busy).Clicked() {
+					a.DeleteTarget = mod.Filename
+				}
+			})
+		}
+	})
+}
+
+func (a *app) renameInstanceView(c *ui.Context, instance engine.Instance) {
+	ui.Row(c).Gap(8).Children(func() {
+		input := ui.TextInput(c, &a.renameValue).Key(instance.ID).Label("实例名称").Grow(1).AutoFocus()
+		if ui.PrimaryButton(c, "保存名称").Clicked() || input.Submitted() {
+			if err := a.engine.RenameInstance(instance, a.renameValue); err != nil {
+				a.status = err.Error()
+				return
+			}
+			a.renaming = ""
+			a.refreshInstances()
+			a.status = "已修改实例名称。"
+		}
+		if ui.Button(c, "取消改名").Clicked() {
+			a.renaming = ""
+		}
+	})
+}
+
+func versionTypeName(kind string) string {
+	switch kind {
+	case "release":
+		return "正式版"
+	case "beta":
+		return "测试版"
+	case "alpha":
+		return "预览版"
+	}
+	return ""
+}
