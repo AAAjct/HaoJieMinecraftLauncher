@@ -3,6 +3,11 @@ package engine
 import (
 	"archive/zip"
 	"bytes"
+	"crypto/sha1"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -29,13 +34,15 @@ func TestPackOverrides(t *testing.T) {
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)
 	}
-	z, err := zip.NewReader(bytes.NewReader(data.Bytes()), int64(data.Len()))
-	if err != nil {
+	archivePath := filepath.Join(t.TempDir(), "example.mrpack")
+	if err := os.WriteFile(archivePath, data.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	if err := installPackFiles(t.Context(), root, packIndex{}, z.File, func(string) {}); err != nil {
-		t.Fatal(err)
+	for _, prefix := range []string{"overrides/", "client-overrides/"} {
+		if err := unpackOverrides(t.Context(), archivePath, root, prefix); err != nil {
+			t.Fatal(err)
+		}
 	}
 	out, err := os.ReadFile(filepath.Join(root, "config", "example.txt"))
 	if err != nil || string(out) != "client" {
@@ -49,24 +56,8 @@ func TestPackOverrides(t *testing.T) {
 }
 
 func TestPackImportCreatesIsolatedInstance(t *testing.T) {
-	e := Engine{DataDir: t.TempDir(), GameRoot: filepath.Join(t.TempDir(), ".minecraft")}
+	e := packTestEngine(t)
 	version := "test-version"
-	base := filepath.Join(e.GameRoot, "versions", version)
-	for name, content := range map[string]string{
-		filepath.Join(base, version+".json"):                               `{"id":"test-version","mainClass":"Main","downloads":{"client":{"url":"https://invalid.example/client.jar"}},"assetIndex":{"id":"test-assets","url":"https://invalid.example/index.json"}}`,
-		filepath.Join(base, version+".jar"):                                "cached client",
-		filepath.Join(e.GameRoot, "assets", "indexes", "test-assets.json"): "{}",
-		filepath.Join(e.javaHome(8), "bin", "java.exe"):                    "cached java",
-		filepath.Join(e.javaHome(8), "bin", "javac.exe"):                   "cached javac",
-		filepath.Join(e.javaHome(8), "release"):                            "JAVA_VERSION=\"1.8.0_472\"\n",
-	} {
-		if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(name, []byte(content), 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
 	path := filepath.Join(t.TempDir(), "example.mrpack")
 	file, err := os.Create(path)
 	if err != nil {
@@ -154,6 +145,115 @@ func TestPackImportCreatesIsolatedInstance(t *testing.T) {
 		t.Fatalf("renaming should skip all occupied suffixes: %+v (%v)", saved, err)
 	}
 }
+
+func packTestEngine(t *testing.T) Engine {
+	t.Helper()
+	e := Engine{DataDir: t.TempDir(), GameRoot: filepath.Join(t.TempDir(), ".minecraft")}
+	version := "test-version"
+	base := filepath.Join(e.GameRoot, "versions", version)
+	for name, content := range map[string]string{
+		filepath.Join(base, version+".json"):                               `{"id":"test-version","mainClass":"Main","downloads":{"client":{"url":"https://invalid.example/client.jar"}},"assetIndex":{"id":"test-assets","url":"https://invalid.example/index.json"}}`,
+		filepath.Join(base, version+".jar"):                                "cached client",
+		filepath.Join(e.GameRoot, "assets", "indexes", "test-assets.json"): "{}",
+		filepath.Join(e.javaHome(8), "bin", "java.exe"):                    "cached java",
+		filepath.Join(e.javaHome(8), "bin", "javac.exe"):                   "cached javac",
+		filepath.Join(e.javaHome(8), "release"):                            "JAVA_VERSION=\"1.8.0_472\"\n",
+	} {
+		if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return e
+}
+
+func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
+	e := packTestEngine(t)
+	dir := t.TempDir()
+	const storedRAR = "UmFyIRoHAM+QcwAADQAAAAAAAACGkXQAgDMAwAAAAMAAAAAC7l6OMwAAAAAUMBMAIAAAAEN1cnNlL21hbmlmZXN0Lmpzb257Im1hbmlmZXN0VHlwZSI6Im1pbmVjcmFmdE1vZHBhY2siLCJtYW5pZmVzdFZlcnNpb24iOjEsIm5hbWUiOiJDdXJzZSBmaXh0dXJlIiwibWluZWNyYWZ0Ijp7InZlcnNpb24iOiJ0ZXN0LXZlcnNpb24ifSwib3ZlcnJpZGVzIjoiY3VzdG9tIiwiZmlsZXMiOlt7InByb2plY3RJRCI6MCwiZmlsZUlEIjowLCJyZXF1aXJlZCI6ZmFsc2V9XX1trnQAgDwACgAAAAoAAAACmomuHgAAAAAUMBwAIAAAAEN1cnNlL2N1c3RvbS9jb25maWcvdGVzdC50eHRyYXIgY29uZmlnBLB7AAAHAA=="
+	rar, err := base64.StdEncoding.DecodeString(storedRAR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rarPath := filepath.Join(dir, "example.RAR")
+	if err := os.WriteFile(rarPath, rar, 0600); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := e.ImportPack(t.Context(), rarPath, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := os.ReadFile(filepath.Join(e.GameDir(instance), "config", "test.txt"))
+	if err != nil || string(config) != "rar config" || instance.Name != "Curse fixture" {
+		t.Fatalf("RAR import: %q, %+v, %v", config, instance, err)
+	}
+
+	const mod = "fixture jar"
+	const cdn = "https://edge.forgecdn.net/files/12/34/mod.jar"
+	t.Setenv("CURSEFORGE_API_KEY", "test-key")
+	previous := client.Transport
+	t.Cleanup(func() { client.Transport = previous })
+	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		code, body := http.StatusOK, ""
+		switch req.URL.Host + req.URL.Path {
+		case "mod.mcimirror.top/curseforge/v1/mods/files":
+			if req.Method != http.MethodPost || req.Header.Get("X-Api-Key") != "" {
+				return nil, fmt.Errorf("unexpected mirror request for metadata")
+			}
+			code = http.StatusServiceUnavailable
+		case "api.curseforge.com/v1/mods/files":
+			request, err := io.ReadAll(req.Body)
+			req.Body.Close()
+			if err != nil || string(request) != `{"fileIds":[1234]}` || req.Header.Get("X-Api-Key") != "test-key" {
+				return nil, fmt.Errorf("invalid official metadata request")
+			}
+			body = fmt.Sprintf(`{"data":[{"id":1234,"modId":42,"fileName":"mod.jar","downloadUrl":%q,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}]}`, cdn, len(mod), sha1.Sum([]byte(mod)))
+		case "mod.mcimirror.top/files/12/34/mod.jar":
+			if req.Header.Get("X-Api-Key") != "" {
+				return nil, fmt.Errorf("official key sent to mirror")
+			}
+			code = http.StatusNotFound
+		case "edge.forgecdn.net/files/12/34/mod.jar":
+			if req.Header.Get("X-Api-Key") != "test-key" {
+				return nil, fmt.Errorf("missing official CDN key")
+			}
+			body = mod
+		default:
+			return nil, fmt.Errorf("unexpected URL %s", req.URL)
+		}
+		return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	var archive bytes.Buffer
+	z := zip.NewWriter(&archive)
+	entry, err := z.Create("manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(entry, `{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Curse ZIP","minecraft":{"version":"test-version"},"files":[{"projectID":42,"fileID":1234,"required":true}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(dir, "example.zip")
+	if err := os.WriteFile(zipPath, archive.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	instance, err = e.ImportPack(t.Context(), zipPath, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := os.ReadFile(filepath.Join(e.GameDir(instance), "mods", "mod.jar"))
+	if err != nil || string(result) != mod {
+		t.Fatalf("ZIP import: %q, %v", result, err)
+	}
+}
+
+type curseTestTransport func(*http.Request) (*http.Response, error)
+
+func (f curseTestTransport) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func TestDefaultFabricAPI(t *testing.T) {
 	if os.Getenv("HJML_INTEGRATION") != "1" {

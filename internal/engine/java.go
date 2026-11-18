@@ -22,6 +22,8 @@ const (
 	azulAPI = "https://api.azul.com/metadata/v1/zulu/packages/"
 )
 
+var javaMajors = []int{8, 17, 21, 25}
+
 var packageID = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
 
 func (e Engine) javaHome(major int) string {
@@ -63,7 +65,7 @@ func (e Engine) InstalledJava() []int {
 	for _, entry := range entries {
 		major, found := strings.CutPrefix(strings.ToLower(entry.Name()), "zulu ")
 		n, err := strconv.Atoi(major)
-		if found && err == nil && n > 0 && isJDK(e.javaHome(n), n) {
+		if found && err == nil && slices.Contains(javaMajors, n) && isJDK(e.javaHome(n), n) {
 			versions = append(versions, n)
 		}
 	}
@@ -71,7 +73,20 @@ func (e Engine) InstalledJava() []int {
 	return versions
 }
 
+func launcherJavaMajor(required int) (int, error) {
+	for _, major := range javaMajors {
+		if required <= major && required >= 0 {
+			return major, nil
+		}
+	}
+	return 0, fmt.Errorf("无法满足 Java %d，启动器提供 Zulu JDK 8、17、21 和 25", required)
+}
+
 func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) (string, error) {
+	major, err := launcherJavaMajor(major)
+	if err != nil {
+		return "", err
+	}
 	ctx = e.resumableDownloads(ctx)
 	target := e.javaHome(major)
 	parent := filepath.Dir(target)

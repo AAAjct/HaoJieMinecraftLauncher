@@ -22,7 +22,6 @@ const minimumResumableSize = 1 << 20
 type downloadCacheKey struct{}
 
 func (e Engine) resumableDownloads(ctx context.Context) context.Context {
-	ctx = withSourcePreferences(ctx)
 	if ctx.Value(downloadCacheKey{}) != nil {
 		return ctx
 	}

@@ -40,7 +40,7 @@ func TestLiveCacheRoundTrip(t *testing.T) {
 		t.Fatal("Minecraft version cache was not persisted")
 	}
 	t.Logf("saved %d Minecraft versions", len(versions))
-	for _, loader := range []string{"fabric", "forge", "quilt"} {
+	for _, loader := range []string{"fabric", "forge", "neoforge"} {
 		start := time.Now()
 		builds, err := core.RefreshBuilds(t.Context(), "1.21.1", loader)
 		if err != nil || len(builds) < 2 {

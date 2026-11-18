@@ -15,12 +15,40 @@ func TestForgeBuildsMatchMinecraftVersion(t *testing.T) {
 	}
 }
 
+func TestNeoForgeBuildsMatchMinecraftVersion(t *testing.T) {
+	versions := []string{
+		"1.20.1-47.1.106", "20.2.59", "21.0.19-beta", "21.1.267",
+		"26.1.0.0-alpha.14+snapshot-11", "26.1.0.7-beta", "26.1.1.2",
+		"26.3.0.9", "26.3.0.10", "26.3.1.2", "26.3.0.1-beta",
+	}
+	for _, test := range []struct {
+		game string
+		want []string
+	}{
+		{"1.20.1", []string{"47.1.106"}},
+		{"1.20.2", []string{"20.2.59"}},
+		{"1.21", []string{"21.0.19-beta"}},
+		{"1.21.1", []string{"21.1.267"}},
+		{"26.1-snapshot-11", []string{"26.1.0.0-alpha.14+snapshot-11"}},
+		{"26.1", []string{"26.1.0.7-beta"}},
+		{"26.3", []string{"26.3.0.10", "26.3.0.9", "26.3.0.1-beta"}},
+	} {
+		var names []string
+		for _, build := range neoForgeBuildsForGame(test.game, versions) {
+			names = append(names, build.Version)
+		}
+		if !slices.Equal(names, test.want) {
+			t.Fatalf("NeoForge %s: got %v, want %v", test.game, names, test.want)
+		}
+	}
+}
+
 func TestLiveLoaderCatalogs(t *testing.T) {
 	if os.Getenv("HJML_INTEGRATION") != "1" {
 		t.Skip("set HJML_INTEGRATION=1 to query the loader catalogs")
 	}
 	for _, item := range []struct{ loader, known string }{
-		{"forge", "52.1.20"}, {"fabric", "0.16.10"}, {"quilt", "0.29.2-beta.5"},
+		{"forge", "52.1.20"}, {"neoforge", "21.1.200"}, {"fabric", "0.16.10"},
 	} {
 		builds, err := LoaderBuilds(t.Context(), "1.21.1", item.loader)
 		if err != nil || len(builds) < 2 || !slices.ContainsFunc(builds, func(b LoaderBuild) bool { return b.Version == item.known }) {

@@ -38,7 +38,7 @@ func Versions(ctx context.Context) ([]Version, error) {
 			return manifest.Versions, nil
 		}
 	}
-	return firstCatalog(ctx, source(manifestURL), source(bmcl+"/mc/game/version_manifest_v2.json"))
+	return preferCatalog(ctx, source(bmcl+"/mc/game/version_manifest_v2.json"), source(manifestURL))
 }
 
 type restriction struct {
@@ -178,10 +178,9 @@ func (e Engine) baseProfile(ctx context.Context, version string) (gameProfile, e
 	if profile.ID != version || profile.MainClass == "" || profile.Downloads.Client.URL == "" {
 		return profile, fmt.Errorf("版本 %s 没有可用客户端", version)
 	}
-	if profile.JavaVersion.MajorVersion == 0 {
-		profile.JavaVersion.MajorVersion = 8
-	}
-	return profile, nil
+	major, err := launcherJavaMajor(profile.JavaVersion.MajorVersion)
+	profile.JavaVersion.MajorVersion = major
+	return profile, err
 }
 
 func (t transfer) copyProfile(ctx context.Context) error {
@@ -189,7 +188,7 @@ func (t transfer) copyProfile(ctx context.Context) error {
 		return err
 	}
 	var err error
-	for _, source := range t.orderedSources(ctx) {
+	for _, source := range t.orderedSources() {
 		t.URL = source
 		if err = t.copy(ctx); err == nil {
 			return nil
@@ -234,17 +233,22 @@ func (e Engine) profile(ctx context.Context, instance Instance, status func(stri
 		return base, err
 	}
 	source := loaderURL(instance.Loader)
-	if (source == "" && instance.Loader != "forge") || !segment(instance.Build) {
+	usesInstaller := instance.Loader == "forge" || instance.Loader == "neoforge"
+	if (source == "" && !usesInstaller) || !segment(instance.Build) {
 		return base, fmt.Errorf("无效或不受支持的加载器")
 	}
 	cache := filepath.Join(e.gameRoot(), "versions", instance.Version, instance.Loader+"-"+instance.Build+".json")
 	var overlay gameProfile
 	if readJSON(cache, &overlay) != nil {
-		if instance.Loader == "forge" {
-			overlay, err = e.installForge(ctx, instance, base, status)
+		if usesInstaller {
+			overlay, err = e.installForgeFamily(ctx, instance, base, status)
 		} else {
 			addr := source + url.PathEscape(instance.Version) + "/" + url.PathEscape(instance.Build) + "/profile/json"
-			err = fetchJSON(ctx, addr, &overlay)
+			if instance.Loader == "fabric" {
+				err = mirroredJSON(ctx, bmcl+"/fabric-meta/v2/versions/loader/"+strings.TrimPrefix(addr, loaderURL("fabric")), addr, &overlay)
+			} else {
+				err = fetchJSON(ctx, addr, &overlay)
+			}
 		}
 		if err != nil {
 			return base, err

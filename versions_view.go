@@ -20,8 +20,8 @@ var loaderOptions = []struct {
 	color          ui.Color
 }{
 	{"forge", "Forge", "F", ui.Hex("#62594C")},
+	{"neoforge", "NeoForge", "N", ui.Hex("#92572E")},
 	{"fabric", "Fabric", "F", ui.Hex("#756348")},
-	{"quilt", "Quilt", "Q", ui.Hex("#62527A")},
 }
 
 var versionListMotion = ui.ElementTransition{

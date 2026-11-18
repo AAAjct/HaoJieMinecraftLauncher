@@ -21,13 +21,13 @@ import (
 )
 
 type artifact struct {
-	URL     string   `json:"url,omitempty"`
-	Path    string   `json:"path,omitempty"`
-	Size    int64    `json:"size,omitempty"`
-	SHA1    string   `json:"sha1,omitempty"`
-	SHA256  string   `json:"sha256,omitempty"`
-	SHA512  string   `json:"sha512,omitempty"`
-	Mirrors []string `json:"-"`
+	URL                 string   `json:"url,omitempty"`
+	Path                string   `json:"path,omitempty"`
+	Size                int64    `json:"size,omitempty"`
+	SHA1                string   `json:"sha1,omitempty"`
+	SHA256              string   `json:"sha256,omitempty"`
+	SHA512              string   `json:"sha512,omitempty"`
+	Mirrors, Alternates []string `json:"-"`
 }
 
 type transfer struct {
@@ -96,7 +96,7 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			return nil
 		}
 	}
-	sources := t.orderedSources(ctx)
+	sources := t.orderedSources()
 	for attempt := range 3 {
 		for _, source := range sources {
 			if ctx.Err() != nil {
@@ -104,7 +104,7 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			}
 			t.URL = source
 			downloadCtx, cancel := ctx, func() {}
-			if len(sources) > 1 && t.Size > 0 && t.Size <= 1<<20 {
+			if source != sources[len(sources)-1] && t.Size > 0 && t.Size <= 1<<20 {
 				downloadCtx, cancel = context.WithTimeout(ctx, 8*time.Second)
 			}
 			if cache != "" {
@@ -184,7 +184,6 @@ func (t transfer) saveTransfer(write func(*os.File, hash.Hash, int64) (int64, er
 }
 
 func ensureAll(ctx context.Context, work []transfer, label string, status func(string)) error {
-	ctx = withSourcePreferences(ctx)
 	total := len(work)
 	var pending []transfer
 	var done int

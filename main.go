@@ -61,15 +61,18 @@ type app struct {
 	activeSearch                               *resourceSearch
 	modNames                                   *engine.ModNames
 	loadModNames                               func() *engine.ModNames
+	modNamesLoading                            bool
 	project                                    engine.Project
 	projectVersions                            map[string]projectVersionResult
 	resourceGroups                             []resourceGroup
 	openResourceGroups                         map[loaderKey]bool
 	fileGame, fileLoader, resourceTarget       string
+	projectPage                                int
+	projectMore                                bool
 	datapackWorld, datapackInstance            string
 	datapackWorlds                             []string
-	resourceLoaders                            []engine.ResourceLoader
 	projectIcons                               map[string]ui.ImageSource
+	cancelProjectIcons                         context.CancelFunc
 	mainScroll, instanceScroll                 ui.ScrollState
 
 	status        string
@@ -250,6 +253,9 @@ func (a *app) refreshMods() {
 				a.modIcons[mod.Filename] = icon
 			}
 			a.mods[index].Icon = nil
+		}
+		if a.page == managePage && len(a.mods) > 0 {
+			a.preloadModNames()
 		}
 	}
 }
@@ -459,16 +465,16 @@ func (a *app) leaveProject() {
 }
 
 type resourceSearch struct {
-	query, submitted, game, loader string
-	results                        []engine.Project
-	page, total, requested         int
-	loaded, failed, pending        bool
-	cache                          map[searchKey]searchResult
+	query, submitted, game, loader, source string
+	results                                []engine.Project
+	page, total, requested                 int
+	loaded, failed, pending                bool
+	cache                                  map[searchKey]searchResult
 }
 
 type searchKey struct {
-	query, game, loader string
-	page                int
+	query, game, loader, source string
+	page                        int
 }
 
 type searchResult struct {
@@ -484,13 +490,16 @@ func (a *app) search(page int) {
 	}
 	state := a.resourceSearches[kind]
 	state.requested, state.failed, state.pending = page, false, false
-	key := searchKey{state.submitted, state.game, state.loader, page}
+	key := searchKey{state.submitted, state.game, state.loader, state.source, page}
 	show := func(result searchResult) {
 		state.results, state.total, state.page, state.loaded = result.hits, result.total, page, true
 		if a.page == downloadsPage && a.kind() == kind {
 			a.mainScroll.Y = 0
 		}
 		a.fetchProjectIcons(result.hits)
+		if kind == "mod" && len(result.hits) > 0 {
+			a.preloadModNames()
+		}
 		a.status = "搜索完成。"
 	}
 	if result, ok := state.cache[key]; ok && time.Since(result.at) < 5*time.Minute {
@@ -499,7 +508,11 @@ func (a *app) search(page int) {
 	}
 	a.activeSearch = state
 	lookup := a.loadModNames
-	a.start(catalogJob, "正在搜索 Modrinth…", func(ctx context.Context, _ func(string)) (func(), error) {
+	search, source := engine.Search, "Modrinth"
+	if key.source == "CurseForge" {
+		search, source = engine.SearchCurseForge, "CurseForge"
+	}
+	a.start(catalogJob, "正在搜索 "+source+"…", func(ctx context.Context, _ func(string)) (func(), error) {
 		query := key.query
 		var names *engine.ModNames
 		translatedSearch := kind == "mod" && lookup != nil && strings.ContainsFunc(query, func(r rune) bool { return unicode.Is(unicode.Han, r) })
@@ -511,7 +524,7 @@ func (a *app) search(page int) {
 		}
 		searchCtx, cancel := context.WithTimeout(ctx, 18*time.Second)
 		defer cancel()
-		hits, total, err := engine.Search(searchCtx, kind, query, engine.Instance{Version: key.game, Loader: key.loader}, page)
+		hits, total, err := search(searchCtx, kind, query, engine.Instance{Version: key.game, Loader: key.loader}, page)
 		return func() {
 			if state.pending {
 				return
@@ -520,7 +533,7 @@ func (a *app) search(page int) {
 				a.modNames = names
 			}
 			result := searchResult{hits, total, time.Now()}
-			if state.cache == nil || len(state.cache) >= 48 {
+			if state.cache == nil || len(state.cache) >= 12 {
 				state.cache = make(map[searchKey]searchResult)
 			}
 			if !translatedSearch || names != nil {
@@ -548,8 +561,12 @@ func (a *app) submitResourceSearch(state *resourceSearch) {
 
 func (a *app) loadProject(p engine.Project) {
 	kind := a.kind()
-	cacheKey := kind + ":" + p.ID
 	state := a.resourceSearches[kind]
+	if isCurseProject(p) {
+		a.loadCursePage(p, state.game, state.loader, 0)
+		return
+	}
+	cacheKey := kind + ":" + p.ID
 	show := func(list []engine.ResourceVersion) {
 		a.project, a.resourceGroups = p, groupResourceVersions(list, a.versionList, kind)
 		a.fileGame, a.fileLoader = state.game, state.loader
@@ -568,14 +585,45 @@ func (a *app) loadProject(p engine.Project) {
 		defer cancel()
 		list, err := engine.ResourceVersions(ctx, p.ID, kind, engine.Instance{})
 		return func() {
-			if a.projectVersions == nil || len(a.projectVersions) >= 24 {
-				a.projectVersions = make(map[string]projectVersionResult)
+			if len(list) <= 256 {
+				if a.projectVersions == nil || len(a.projectVersions) >= 8 {
+					a.projectVersions = make(map[string]projectVersionResult)
+				}
+				a.projectVersions[cacheKey] = projectVersionResult{list, time.Now()}
 			}
-			a.projectVersions[cacheKey] = projectVersionResult{list, time.Now()}
 			if a.page != downloadsPage || a.kind() != kind {
 				return
 			}
 			show(list)
+		}, err
+	})
+}
+
+func isCurseProject(p engine.Project) bool {
+	return strings.HasPrefix(p.ID, "curseforge:")
+}
+
+func (a *app) loadCursePage(project engine.Project, game, loader string, page int) {
+	kind := a.kind()
+	current := a.project.ID
+	a.start(catalogJob, "正在读取 CurseForge 项目版本…", func(ctx context.Context, _ func(string)) (func(), error) {
+		ctx, cancel := context.WithTimeout(ctx, 18*time.Second)
+		defer cancel()
+		list, more, err := engine.CurseForgeVersions(ctx, project.ID, kind, engine.Instance{Version: game, Loader: loader}, page)
+		return func() {
+			if a.page != downloadsPage || a.kind() != kind || a.project.ID != current {
+				return
+			}
+			if current == "" {
+				a.resourceTarget = a.selected
+				a.datapackInstance = ""
+			}
+			a.project, a.resourceGroups = project, groupResourceVersions(list, a.versionList, kind)
+			a.projectPage, a.projectMore = page, more
+			a.fileGame, a.fileLoader = game, loader
+			clear(a.openResourceGroups)
+			a.mainScroll.Y = 0
+			a.status = "项目版本已加载。"
 		}, err
 	})
 }
@@ -657,6 +705,8 @@ func loaderName(i engine.Instance) string {
 		return "Quilt"
 	case "forge":
 		return "Forge"
+	case "neoforge":
+		return "NeoForge"
 	default:
 		return "原版"
 	}
@@ -664,6 +714,22 @@ func loaderName(i engine.Instance) string {
 
 func (a *app) hasVersion() bool {
 	return slices.ContainsFunc(a.versionList, func(v engine.Version) bool { return v.ID == a.targetVersion })
+}
+
+func (a *app) preloadModNames() {
+	if a.modNames != nil || a.modNamesLoading || a.loadModNames == nil || a.window == nil {
+		return
+	}
+	a.modNamesLoading = true
+	go func() {
+		names := a.loadModNames()
+		if a.catalogContext.Err() == nil {
+			a.window.Update(func() {
+				a.modNamesLoading = false
+				a.modNames = names
+			})
+		}
+	}()
 }
 
 func main() {
@@ -711,20 +777,8 @@ func main() {
 		removeWindowBorder(a.window)
 		a.window.OnClosed(stopCatalog)
 		a.refreshSkinAvatar()
-		go func() {
-			names := a.loadModNames()
-			if catalogCtx.Err() == nil {
-				a.window.Update(func() { a.modNames = names })
-			}
-		}()
 		a.downloadVersions(false)
 		a.preloadRecentBuilds()
-		go func() {
-			loaders, err := engine.ResourceLoaders(catalogCtx)
-			if err == nil && catalogCtx.Err() == nil {
-				a.window.Update(func() { a.resourceLoaders = loaders })
-			}
-		}()
 		a.window.OnFileDrop(func(event *mygo.FileDropEvent) {
 			paths := slices.Clone(event.Paths)
 			a.window.Update(func() { a.receiveFiles(paths) })

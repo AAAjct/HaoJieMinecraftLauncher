@@ -195,32 +195,31 @@ func TestDownloadProgressBeforeFirstFileCompletes(t *testing.T) {
 	}
 }
 
-func TestDownloadsPreferFasterMirrorAndReuseProbe(t *testing.T) {
-	content := bytes.Repeat([]byte{1}, 512<<10)
-	var slowRequests, fastRequests atomic.Int32
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		slowRequests.Add(1)
-		select {
-		case <-r.Context().Done():
-		case <-time.After(time.Second):
-			http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(content))
+func TestDownloadsPreferMirrorAndFallBackAfterHashMismatch(t *testing.T) {
+	content := []byte("valid file")
+	var officialRequests, mirrorRequests atomic.Int32
+	official := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		officialRequests.Add(1)
+		_, _ = w.Write(content)
+	}))
+	defer official.Close()
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mirrorRequests.Add(1)
+		if r.URL.Path == "/fallback.jar" {
+			_, _ = w.Write([]byte("wrong file"))
+			return
 		}
+		_, _ = w.Write(content)
 	}))
-	defer slow.Close()
-	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fastRequests.Add(1)
-		http.ServeContent(w, r, "file", time.Time{}, bytes.NewReader(content))
-	}))
-	defer fast.Close()
-	ctx := withSourcePreferences(t.Context())
-	for _, name := range []string{"one.jar", "two.jar"} {
-		file := artifact{URL: slow.URL + "/" + name, Mirrors: []string{fast.URL + "/" + name},
+	defer mirror.Close()
+	for _, name := range []string{"mirror.jar", "fallback.jar"} {
+		file := artifact{URL: official.URL + "/" + name, Mirrors: []string{mirror.URL + "/" + name},
 			Size: int64(len(content)), SHA256: fmt.Sprintf("%x", sha256.Sum256(content))}
-		if err := (transfer{file, filepath.Join(t.TempDir(), name)}).ensure(ctx); err != nil {
+		if err := (transfer{file, filepath.Join(t.TempDir(), name)}).ensure(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if fastRequests.Load() != 3 || slowRequests.Load() > 1 {
-		t.Fatalf("expected one speed probe followed by both downloads on the faster mirror, got slow=%d fast=%d", slowRequests.Load(), fastRequests.Load())
+	if mirrorRequests.Load() != 2 || officialRequests.Load() != 1 {
+		t.Fatalf("mirror=%d official=%d, expected two mirror requests and one fallback", mirrorRequests.Load(), officialRequests.Load())
 	}
 }

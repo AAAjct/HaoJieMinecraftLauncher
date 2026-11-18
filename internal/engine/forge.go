@@ -35,27 +35,51 @@ func recommendedForge(ctx context.Context, version string) (string, error) {
 	return "", fmt.Errorf("Forge 暂无 Minecraft %s 的推荐或最新构建", version)
 }
 
-func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, status func(string)) (gameProfile, error) {
+func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gameProfile, status func(string)) (gameProfile, error) {
 	var overlay gameProfile
-	if !forgeBuild.MatchString(i.Build) {
+	name, artifactName, repository := "Forge", "forge", forgeMaven
+	build := i.Version + "-" + i.Build
+	if i.Loader == "neoforge" {
+		name = "NeoForge"
+		artifactName = neoForgeArtifact(i.Version)
+		repository = neoForgeMaven + artifactName + "/"
+		if !neoForgeMatches(i.Version, i.Build) {
+			return overlay, fmt.Errorf("NeoForge %s 与 Minecraft %s 不兼容", i.Build, i.Version)
+		}
+		if i.Version != "1.20.1" {
+			build = i.Build
+		}
+	} else if !forgeBuild.MatchString(i.Build) {
 		return overlay, fmt.Errorf("Forge 构建版本无效")
 	}
-	build := i.Version + "-" + i.Build
-	addr := forgeMaven + build + "/forge-" + build + "-installer.jar"
-	res, err := get(ctx, addr+".sha1")
+	addr := repository + build + "/" + artifactName + "-" + build + "-installer.jar"
+	mirror := minecraftMirror(addr)
+	source := func(address string) catalogSource[string] {
+		return func(ctx context.Context) (string, error) {
+			res, err := get(ctx, address+".sha1")
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+			sha, err := io.ReadAll(io.LimitReader(res.Body, 512))
+			if err != nil {
+				return "", err
+			}
+			checksum := strings.ToLower(strings.TrimSpace(string(sha)))
+			if !validAssetHash(checksum) {
+				return "", fmt.Errorf("%s 安装器缺少有效的 SHA-1", name)
+			}
+			return checksum, nil
+		}
+	}
+	checksum, err := preferCatalog(ctx, source(mirror), source(addr))
 	if err != nil {
 		return overlay, err
 	}
-	sha, err := io.ReadAll(io.LimitReader(res.Body, 512))
-	res.Body.Close()
-	checksum := strings.ToLower(strings.TrimSpace(string(sha)))
-	if err != nil || !validAssetHash(checksum) {
-		return overlay, fmt.Errorf("Forge 安装器缺少有效的 SHA-1")
-	}
-	cacheRoot := filepath.Join(e.gameRoot(), "forge")
+	cacheRoot := filepath.Join(e.gameRoot(), i.Loader)
 	installer := filepath.Join(cacheRoot, build+"-installer.jar")
-	status("下载 Forge 安装器 · " + i.Build)
-	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, minecraftMirror(addr))
+	status("下载 " + name + " 安装器 · " + i.Build)
+	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, mirror)
 	if err := (transfer{file, installer}).ensure(ctx); err != nil {
 		return overlay, err
 	}
@@ -63,22 +87,22 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 	if err != nil {
 		return overlay, err
 	}
-	body, err := z.Open("version.json")
-	if err != nil {
-		z.Close()
-		return overlay, fmt.Errorf("Forge %s 的旧版安装格式暂未支持", i.Build)
+	defer z.Close()
+	if err := installerJSON(&z.Reader, "version.json", &overlay); err != nil {
+		return overlay, fmt.Errorf("读取 %s 安装器中的版本文件：%w", name, err)
 	}
-	err = json.NewDecoder(io.LimitReader(body, 8<<20)).Decode(&overlay)
-	body.Close()
-	z.Close()
-	if err != nil || !segment(overlay.ID) || overlay.InheritsFrom != i.Version {
-		return overlay, fmt.Errorf("Forge 安装器中的版本文件无效")
+	if !segment(overlay.ID) || overlay.InheritsFrom != i.Version {
+		return overlay, fmt.Errorf("%s 安装器中的版本文件无效", name)
+	}
+	var installProfile struct{ Libraries []library }
+	if err := installerJSON(&z.Reader, "install_profile.json", &installProfile); err != nil {
+		return overlay, fmt.Errorf("读取 %s 安装清单：%w", name, err)
 	}
 	java, err := e.EnsureJava(ctx, base.JavaVersion.MajorVersion, status)
 	if err != nil {
 		return overlay, err
 	}
-	stage, err := os.MkdirTemp(cacheRoot, ".forge-")
+	stage, err := os.MkdirTemp(cacheRoot, ".installer-")
 	if err != nil {
 		return overlay, err
 	}
@@ -97,20 +121,31 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 	if err := os.Link(jar, filepath.Join(vanilla, i.Version+".jar")); err != nil {
 		return overlay, err
 	}
-	status("正在执行 Forge 安装处理器…")
-	if err := runForge(ctx, java, installer, stage, filepath.Join(cacheRoot, build+"-install-*.log"), status); err != nil {
+	description, err := os.ReadFile(e.baseVersionFile(i.Version, ".json"))
+	if err != nil {
+		return overlay, err
+	}
+	if err := os.WriteFile(filepath.Join(vanilla, i.Version+".json"), description, 0600); err != nil {
+		return overlay, err
+	}
+	libRoot := filepath.Join(stage, "libraries")
+	libraries := append(append(installProfile.Libraries, overlay.Libraries...), base.Libraries...)
+	if err := e.prepareInstallerLibraries(ctx, &z.Reader, libRoot, libraries, status); err != nil {
+		return overlay, err
+	}
+	status("正在执行 " + name + " 安装处理器…")
+	if err := runForgeInstaller(ctx, name, java, installer, stage, filepath.Join(cacheRoot, build+"-install-*.log"), status); err != nil {
 		return overlay, err
 	}
 	if err := readJSON(filepath.Join(stage, "versions", overlay.ID, overlay.ID+".json"), &overlay); err != nil {
 		return overlay, err
 	}
-	libRoot := filepath.Join(stage, "libraries")
 	err = filepath.WalkDir(libRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
 			return err
 		}
 		if !entry.Type().IsRegular() {
-			return fmt.Errorf("Forge 生成了无效的库文件")
+			return fmt.Errorf("%s 生成了无效的库文件", name)
 		}
 		relative, err := filepath.Rel(libRoot, path)
 		if err != nil {
@@ -131,7 +166,66 @@ func (e Engine) installForge(ctx context.Context, i Instance, base gameProfile, 
 	return overlay, err
 }
 
-func runForge(ctx context.Context, java, installer, stage, logPath string, status func(string)) error {
+func installerJSON(archive *zip.Reader, name string, out any) error {
+	file, err := archive.Open(name)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return json.NewDecoder(io.LimitReader(file, 8<<20)).Decode(out)
+}
+
+func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Reader, target string, libraries []library, status func(string)) error {
+	shared := filepath.Join(e.gameRoot(), "libraries")
+	var work []transfer
+	seen := make(map[string]bool)
+	for _, lib := range libraries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !permitted(lib.Rules, nil) {
+			continue
+		}
+		artifacts := []artifact{lib.Downloads.Artifact}
+		if classifier := lib.Natives["windows"]; classifier != "" {
+			artifacts = append(artifacts, lib.Downloads.Classifiers[strings.ReplaceAll(classifier, "${arch}", "64")])
+		}
+		for _, file := range artifacts {
+			if file.Path == "" || file.URL == "" {
+				continue
+			}
+			key := strings.ToLower(file.Path)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			path, err := localPath(target, file.Path)
+			if err != nil {
+				return err
+			}
+			if embedded, err := archive.Open("maven/" + file.Path); err == nil {
+				embedded.Close()
+				continue
+			}
+			cache := transfer{file, filepath.Join(shared, filepath.FromSlash(file.Path))}
+			if digest, _ := cache.digest(); digest != nil && cache.ready() {
+				verified, _ := installedResource(cache, false)
+				if verified {
+					if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+						return err
+					}
+					if err := os.Link(cache.target, path); err == nil {
+						continue
+					}
+				}
+			}
+			work = append(work, transfer{withMinecraftMirror(file, minecraftMirror(file.URL)), path})
+		}
+	}
+	return ensureAll(ctx, work, "下载加载器运行库", status)
+}
+
+func runForgeInstaller(ctx context.Context, name, java, installer, stage, logPath string, status func(string)) error {
 	log, err := os.CreateTemp(filepath.Dir(logPath), filepath.Base(logPath))
 	if err != nil {
 		return err
@@ -165,7 +259,7 @@ func runForge(ctx context.Context, java, installer, stage, logPath string, statu
 		}
 		if time.Since(last) > 250*time.Millisecond && len(line) < 150 &&
 			(strings.HasPrefix(line, "Processor:") || strings.HasPrefix(line, "Considering ")) {
-			status("Forge · " + line)
+			status(name + " · " + line)
 			last = time.Now()
 		}
 	}
@@ -176,7 +270,7 @@ func runForge(ctx context.Context, java, installer, stage, logPath string, statu
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("Forge 安装失败，请查看 %s", logPath)
+		return fmt.Errorf("%s 安装失败，请查看 %s", name, logPath)
 	}
 	return nil
 }

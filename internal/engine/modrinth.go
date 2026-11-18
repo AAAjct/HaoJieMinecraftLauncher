@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"archive/zip"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +18,10 @@ import (
 
 const modrinth = "https://api.modrinth.com/v2/"
 
+func modrinthJSON[T any](ctx context.Context, path string, out *T) error {
+	return mirroredJSON(ctx, mcim+"/modrinth/v2/"+path, modrinth+path, out)
+}
+
 var resourcePublishMu sync.Mutex
 
 type Project struct {
@@ -35,28 +38,25 @@ type Project struct {
 	DateModified      time.Time `json:"date_modified"`
 }
 
-type ResourceLoader struct {
-	Name         string
-	ProjectTypes []string `json:"supported_project_types"`
-}
-
-func ResourceLoaders(ctx context.Context) ([]ResourceLoader, error) {
-	var loaders []ResourceLoader
-	err := fetchJSON(ctx, modrinth+"tag/loader", &loaders)
-	return loaders, err
-}
-
 func ProjectIcon(ctx context.Context, source string) ([]byte, error) {
 	u, err := url.Parse(source)
-	if err != nil || u.Scheme != "https" || u.Host != "cdn.modrinth.com" || u.User != nil {
+	if err != nil || u.Scheme != "https" || !slices.Contains([]string{"cdn.modrinth.com", "media.forgecdn.net", "mediafiles.forgecdn.net", "mediafilez.forgecdn.net", "edge.forgecdn.net"}, u.Host) || u.User != nil {
 		return nil, fmt.Errorf("无效的项目图标地址")
 	}
-	res, err := get(ctx, source)
-	if err != nil {
-		return nil, err
+	from := func(address string) catalogSource[[]byte] {
+		return func(ctx context.Context) ([]byte, error) {
+			res, err := get(ctx, address)
+			if err != nil {
+				return nil, err
+			}
+			defer res.Body.Close()
+			return io.ReadAll(io.LimitReader(res.Body, 2<<20))
+		}
 	}
-	defer res.Body.Close()
-	return io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if mirror := resourceMirror(source); mirror != "" {
+		return preferCatalog(ctx, from(mirror), from(source))
+	}
+	return from(source)(ctx)
 }
 
 type ResourceVersion struct {
@@ -68,11 +68,13 @@ type ResourceVersion struct {
 	GameVersions  []string `json:"game_versions"`
 	Loaders       []string
 	Files         []resourceFile
-	Dependencies  []struct {
-		ProjectID string `json:"project_id"`
-		VersionID string `json:"version_id"`
-		Type      string `json:"dependency_type"`
-	}
+	Dependencies  []resourceDependency
+}
+
+type resourceDependency struct {
+	ProjectID string `json:"project_id"`
+	VersionID string `json:"version_id"`
+	Type      string `json:"dependency_type"`
 }
 
 type resourceFile struct {
@@ -81,6 +83,7 @@ type resourceFile struct {
 	Primary  bool
 	Size     int64
 	Hashes   struct{ SHA512 string }
+	SHA1     string `json:"-"`
 }
 
 const ResourcePageSize = 12
@@ -90,8 +93,16 @@ func Search(ctx context.Context, kind, query string, filter Instance, page int) 
 	if filter.Version != "" {
 		filters = append(filters, []string{"versions:" + filter.Version})
 	}
-	if filter.Loader != "" && kind != "datapack" && kind != "resourcepack" {
-		filters = append(filters, []string{"categories:" + filter.Loader})
+	if kind == "mod" || kind == "modpack" {
+		loaders := modLoaders
+		if SupportedModLoader(filter.Loader) {
+			loaders = []string{filter.Loader}
+		}
+		facets := make([]string, 0, len(loaders))
+		for _, loader := range loaders {
+			facets = append(facets, "categories:"+loader)
+		}
+		filters = append(filters, facets)
 	}
 	facets, _ := json.Marshal(filters)
 	q := url.Values{"query": {query}, "facets": {string(facets)}, "limit": {strconv.Itoa(ResourcePageSize)}, "offset": {strconv.Itoa(max(0, page) * ResourcePageSize)}}
@@ -99,16 +110,23 @@ func Search(ctx context.Context, kind, query string, filter Instance, page int) 
 		Hits  []Project
 		Total int `json:"total_hits"`
 	}
-	err := fetchJSON(ctx, modrinth+"search?"+q.Encode(), &search)
+	err := modrinthJSON(ctx, "search?"+q.Encode(), &search)
 	return search.Hits, search.Total, err
 }
 
 func ResourceVersions(ctx context.Context, id, kind string, instance Instance) ([]ResourceVersion, error) {
+	if strings.HasPrefix(id, cursePrefix) {
+		versions, _, err := CurseForgeVersions(ctx, id, kind, instance, 0)
+		return versions, err
+	}
 	q := url.Values{"include_changelog": {"false"}}
 	if kind == "datapack" {
 		q.Set("loaders", `["datapack"]`)
 	}
 	if kind == "mod" {
+		if instance.Loader != "" && !SupportedModLoader(instance.Loader) {
+			return nil, fmt.Errorf("不提供 %s 加载器筛选", instance.Loader)
+		}
 		for key, value := range map[string]string{"game_versions": instance.Version, "loaders": instance.Loader} {
 			if value != "" {
 				data, _ := json.Marshal([]string{value})
@@ -117,14 +135,14 @@ func ResourceVersions(ctx context.Context, id, kind string, instance Instance) (
 		}
 	}
 	var versions []ResourceVersion
-	err := fetchJSON(ctx, modrinth+"project/"+url.PathEscape(id)+"/version?"+q.Encode(), &versions)
+	err := modrinthJSON(ctx, "project/"+url.PathEscape(id)+"/version?"+q.Encode(), &versions)
 	return versions, err
 }
 
 func (v ResourceVersion) selectedFile(extension string) (resourceFile, error) {
 	var candidate resourceFile
 	for _, file := range v.Files {
-		if !segment(file.Filename) || !strings.HasSuffix(strings.ToLower(file.Filename), extension) {
+		if !segment(file.Filename) || (extension != "" && !strings.HasSuffix(strings.ToLower(file.Filename), extension)) {
 			continue
 		}
 		if candidate.Filename == "" || file.Primary {
@@ -135,10 +153,16 @@ func (v ResourceVersion) selectedFile(extension string) (resourceFile, error) {
 		}
 	}
 	source, err := url.Parse(candidate.URL)
-	if err != nil || source.Scheme != "https" || source.Host != "cdn.modrinth.com" || !validSHA512(candidate.Hashes.SHA512) {
-		return resourceFile{}, fmt.Errorf("%s 没有可校验的 %s 下载", v.Name, extension)
+	if err == nil && source.Scheme == "https" && source.User == nil {
+		if source.Host == "cdn.modrinth.com" && validSHA512(candidate.Hashes.SHA512) ||
+			curseForgeCDN(source.Host) && validAssetHash(candidate.SHA1) {
+			return candidate, nil
+		}
 	}
-	return candidate, nil
+	if strings.HasPrefix(v.ID, cursePrefix) && candidate.Filename != "" && candidate.URL == "" {
+		return resourceFile{}, fmt.Errorf("CurseForge 未提供 %s 的第三方下载地址", candidate.Filename)
+	}
+	return resourceFile{}, fmt.Errorf("%s 没有可校验的下载文件", v.Name)
 }
 
 func validSHA512(s string) bool {
@@ -146,7 +170,7 @@ func validSHA512(s string) bool {
 }
 
 func (f resourceFile) transfer(dir string) transfer {
-	return transfer{artifact{URL: f.URL, SHA512: f.Hashes.SHA512, Size: f.Size}, filepath.Join(dir, f.Filename)}
+	return transfer{artifact{URL: f.URL, SHA512: f.Hashes.SHA512, SHA1: f.SHA1, Size: f.Size}, filepath.Join(dir, f.Filename)}
 }
 
 func resolveMods(ctx context.Context, instance Instance, root ResourceVersion) ([]resourceFile, error) {
@@ -179,7 +203,7 @@ func resolveMods(ctx context.Context, instance Instance, root ResourceVersion) (
 			var next ResourceVersion
 			switch {
 			case dep.VersionID != "":
-				if err := fetchJSON(ctx, modrinth+"version/"+url.PathEscape(dep.VersionID), &next); err != nil {
+				if err := modrinthJSON(ctx, "version/"+url.PathEscape(dep.VersionID), &next); err != nil {
 					return err
 				}
 			case dep.ProjectID != "":
@@ -190,10 +214,13 @@ func resolveMods(ctx context.Context, instance Instance, root ResourceVersion) (
 				if err != nil {
 					return err
 				}
-				if len(all) == 0 {
+				compatible := slices.IndexFunc(all, func(v ResourceVersion) bool {
+					return slices.Contains(v.GameVersions, instance.Version) && slices.Contains(v.Loaders, instance.Loader)
+				})
+				if compatible < 0 {
 					return fmt.Errorf("找不到兼容的依赖 %s", dep.ProjectID)
 				}
-				next = all[0]
+				next = all[compatible]
 			default:
 				return fmt.Errorf("%s 有无法自动解析的必需依赖", version.Name)
 			}
@@ -227,8 +254,8 @@ func (e Engine) installResource(ctx context.Context, kind string, instance Insta
 	var folder string
 	switch kind {
 	case "mod":
-		if instance.Loader == "" {
-			return fmt.Errorf("请先选择带模组加载器的实例")
+		if !SupportedModLoader(instance.Loader) {
+			return fmt.Errorf("请先选择带 Fabric、Forge 或 NeoForge 的实例")
 		}
 		status("正在解析必需模组依赖…")
 		files, err = resolveMods(ctx, instance, version)
@@ -270,7 +297,7 @@ func (e Engine) installResource(ctx context.Context, kind string, instance Insta
 		return err
 	}
 	if err := ensureAll(ctx, work, "下载资源", status); err != nil {
-		return err
+		return curseDownloadError(err)
 	}
 	resourcePublishMu.Lock()
 	defer resourcePublishMu.Unlock()
@@ -383,14 +410,18 @@ type packIndex struct {
 
 func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, status func(string)) (Instance, error) {
 	ctx = e.resumableDownloads(ctx)
-	file, err := version.selectedFile(".mrpack")
+	extension := ".mrpack"
+	if strings.HasPrefix(version.ID, cursePrefix) {
+		extension = ""
+	}
+	file, err := version.selectedFile(extension)
 	if err != nil {
 		return Instance{}, err
 	}
 	if err := os.MkdirAll(e.gameRoot(), 0700); err != nil {
 		return Instance{}, err
 	}
-	stage, err := os.MkdirTemp(e.gameRoot(), ".mrpack-")
+	stage, err := os.MkdirTemp(e.gameRoot(), ".pack-")
 	if err != nil {
 		return Instance{}, err
 	}
@@ -398,26 +429,14 @@ func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, statu
 	status("正在下载整合包清单…")
 	item := file.transfer(stage)
 	if err := item.ensure(ctx); err != nil {
-		return Instance{}, err
+		return Instance{}, curseDownloadError(err)
 	}
 	return e.ImportPack(ctx, item.target, status)
 }
 
-func (e Engine) ImportPack(ctx context.Context, path string, status func(string)) (Instance, error) {
-	ctx = e.resumableDownloads(ctx)
-	z, err := zip.OpenReader(path)
-	if err != nil {
-		return Instance{}, err
-	}
-	defer z.Close()
-	meta, err := z.Open("modrinth.index.json")
-	if err != nil {
-		return Instance{}, fmt.Errorf("整合包缺少 modrinth.index.json")
-	}
+func (e Engine) importModrinthPack(ctx context.Context, archive, root string, data []byte, status func(string)) (Instance, error) {
 	var index packIndex
-	err = json.NewDecoder(io.LimitReader(meta, 8<<20)).Decode(&index)
-	meta.Close()
-	if err != nil {
+	if err := json.Unmarshal(data, &index); err != nil {
 		return Instance{}, err
 	}
 	version := index.Dependencies["minecraft"]
@@ -429,7 +448,7 @@ func (e Engine) ImportPack(ctx context.Context, path string, status func(string)
 		switch id {
 		case "minecraft":
 			continue
-		case "fabric-loader", "quilt-loader", "forge":
+		case "fabric-loader", "forge", "neoforge":
 			if instance.Loader != "" || !segment(build) {
 				return Instance{}, fmt.Errorf("整合包要求多个加载器或加载器版本无效")
 			}
@@ -439,11 +458,19 @@ func (e Engine) ImportPack(ctx context.Context, path string, status func(string)
 		}
 	}
 	return e.createInstance(ctx, instance, func(game string) error {
-		return installPackFiles(ctx, game, index, z.File, status)
+		if err := installPackFiles(ctx, game, index, status); err != nil {
+			return err
+		}
+		for _, prefix := range []string{"overrides/", "client-overrides/"} {
+			if err := unpackOverrides(ctx, archive, game, root+prefix); err != nil {
+				return err
+			}
+		}
+		return nil
 	}, status)
 }
 
-func installPackFiles(ctx context.Context, game string, index packIndex, archive []*zip.File, status func(string)) error {
+func installPackFiles(ctx context.Context, game string, index packIndex, status func(string)) error {
 	var work []transfer
 	targets := map[string]bool{}
 	for _, entry := range index.Files {
@@ -459,7 +486,7 @@ func installPackFiles(ctx context.Context, game string, index packIndex, archive
 		var sources []string
 		for _, raw := range entry.Downloads {
 			addr, err := url.Parse(raw)
-			if err == nil && addr.Scheme == "https" && slices.Contains(
+			if err == nil && addr.Scheme == "https" && addr.User == nil && slices.Contains(
 				[]string{"cdn.modrinth.com", "github.com", "raw.githubusercontent.com", "gitlab.com"}, addr.Host) {
 				sources = append(sources, raw)
 			}
@@ -467,28 +494,7 @@ func installPackFiles(ctx context.Context, game string, index packIndex, archive
 		if len(sources) == 0 {
 			return fmt.Errorf("整合包文件 %q 缺少受支持的 HTTPS 下载源", entry.Path)
 		}
-		work = append(work, transfer{artifact{URL: sources[0], Mirrors: sources[1:], Size: entry.FileSize, SHA512: entry.Hashes.SHA512}, target})
+		work = append(work, transfer{artifact{URL: sources[0], Alternates: sources[1:], Size: entry.FileSize, SHA512: entry.Hashes.SHA512}, target})
 	}
-	if err := ensureAll(ctx, work, "下载整合包资源", status); err != nil {
-		return err
-	}
-	for _, prefix := range []string{"overrides/", "client-overrides/"} {
-		for _, entry := range archive {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			relative, hasPrefix := strings.CutPrefix(entry.Name, prefix)
-			if !hasPrefix || entry.FileInfo().IsDir() {
-				continue
-			}
-			target, err := localPath(game, relative)
-			if err != nil {
-				return err
-			}
-			if err := writeZipEntry(ctx, entry, target); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return ensureAll(ctx, work, "下载整合包资源", status)
 }

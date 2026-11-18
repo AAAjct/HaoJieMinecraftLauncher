@@ -235,7 +235,11 @@ func TestResourceDetailsGroupAndFilterFiles(t *testing.T) {
 	a.resourceGroups = groupResourceVersions([]engine.ResourceVersion{
 		{ID: "modern", Name: "Mouse Tweaks Modern", VersionNumber: "2.0", GameVersions: []string{"1.21.1"}, Loaders: []string{"fabric", "forge"}},
 		{ID: "older", Name: "Mouse Tweaks Old", VersionNumber: "1.0", GameVersions: []string{"1.20.1"}, Loaders: []string{"forge"}},
+		{ID: "quilt", Name: "Unsupported", GameVersions: []string{"1.21.1"}, Loaders: []string{"quilt"}},
 	}, nil, "mod")
+	if slices.ContainsFunc(a.resourceGroups, func(group resourceGroup) bool { return group.key.loader == "quilt" }) {
+		t.Fatal("Quilt should not appear as a resource download")
+	}
 	test := ui.NewTester(a.view, 1020, 675)
 	if test.HasText("Mouse Tweaks Modern") || !test.HasText("Forge 1.20.1（1）") {
 		t.Fatalf("expected collapsed file groups: %q", test.Texts())
@@ -360,7 +364,7 @@ func TestDownloadCategoriesAndLocalImportLayout(t *testing.T) {
 		t.Fatal("world downloads should not appear in the download sidebar")
 	}
 	for _, entry := range []struct{ name, field string }{
-		{"数据包", "搜索数据包"}, {"资源包", "搜索资源包"},
+		{"整合包", "从文件安装"}, {"数据包", "搜索数据包"}, {"资源包", "搜索资源包"},
 	} {
 		if err := test.Click(entry.name); err != nil {
 			t.Fatal(err)
@@ -368,6 +372,9 @@ func TestDownloadCategoriesAndLocalImportLayout(t *testing.T) {
 		test.Advance(300 * time.Millisecond)
 		if _, ok := test.Find(entry.field); !ok {
 			t.Fatalf("download category %s did not expose %s", entry.name, entry.field)
+		}
+		if _, ok := test.Find("资源来源"); !ok {
+			t.Fatalf("download category %s did not expose the source picker", entry.name)
 		}
 	}
 	before, ok := test.Find("就绪")
@@ -545,6 +552,19 @@ func TestChooseGameAndLoaderBuild(t *testing.T) {
 	}
 	if i := a.installSelection(); i.Version != "" || i.Loader != "" || i.Build != "" {
 		t.Fatalf("stale install selection %+v", i)
+	}
+}
+
+func TestInstanceImportAvailableWithoutAnInstance(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	a.page = managePage
+	test := ui.NewTester(a.view, 1020, 675)
+	if !test.HasText("我的实例") || !test.HasText("导入") || test.HasText("从文件安装") {
+		t.Fatalf("unexpected empty instance controls: %v", test.Texts())
+	}
+	files := splitImportFiles([]string{"first.jar", "second.JAR", "first.zip", "second.RAR", "third.mrpack", "other.txt"})
+	if len(files.mods) != 2 || len(files.packs) != 3 {
+		t.Fatalf("incorrect file classification: %+v", files)
 	}
 }
 

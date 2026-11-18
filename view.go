@@ -211,7 +211,13 @@ func (a *app) windowButtons(c *ui.Context) {
 
 func (a *app) instanceList(c *ui.Context) {
 	ui.Column(c).Grow(1).Padding(15).Gap(9).Children(func() {
-		ui.Text(c, "我的实例").FontSize(16).Bold()
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "我的实例").FontSize(16).Bold()
+			ui.Spacer(c).Grow(1)
+			if ui.Button(c, "导入").Tooltip("导入 ZIP、RAR 或 MRPACK 整合包").Clicked() {
+				a.choosePacks()
+			}
+		})
 		if len(a.instances) == 0 {
 			ui.Text(c, "安装游戏版本或导入整合包后，实例会出现在这里。").
 				FontSize(13).TextColor(a.theme.TextMuted)
@@ -306,7 +312,7 @@ func (a *app) manageView(c *ui.Context) {
 				a.refreshMods()
 			}
 			if ui.Button(c, "从文件安装").Disabled(a.gameInUse(i)).Clicked() {
-				a.chooseFiles()
+				a.chooseMods(i)
 			}
 			if ui.Button(c, "删除实例").TextColor(danger).Disabled(a.inUse(i)).Clicked() {
 				a.deleteConfirm = true

@@ -12,14 +12,25 @@ import (
 	"time"
 )
 
-var client = &http.Client{Timeout: 15 * time.Minute, Transport: func() *http.Transport {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.MaxIdleConns = 128
-	transport.MaxIdleConnsPerHost = 40
-	transport.MaxConnsPerHost = 48
-	transport.ResponseHeaderTimeout = 40 * time.Second
-	return transport
-}()}
+var client = &http.Client{
+	Timeout: 15 * time.Minute,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("重定向次数过多")
+		}
+		if req.URL.Scheme != "https" || !curseForgeHost(req.URL.Host) {
+			req.Header.Del("X-Api-Key")
+		}
+		return nil
+	},
+	Transport: func() *http.Transport {
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.MaxIdleConns = 128
+		transport.MaxIdleConnsPerHost = 40
+		transport.MaxConnsPerHost = 48
+		transport.ResponseHeaderTimeout = 15 * time.Second
+		return transport
+	}()}
 
 type Engine struct {
 	DataDir  string
@@ -44,11 +55,23 @@ func get(ctx context.Context, url string) (*http.Response, error) {
 }
 
 func getHTTP(ctx context.Context, url, byteRange string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	return requestHTTP(ctx, http.MethodGet, url, byteRange, nil)
+}
+
+func requestHTTP(ctx context.Context, method, address, byteRange string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, address, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "HaoJieMinecraftLauncher/1.0")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if req.URL.Scheme == "https" && curseForgeHost(req.URL.Host) {
+		if key := curseForgeKey(); key != "" {
+			req.Header.Set("X-Api-Key", key)
+		}
+	}
 	if byteRange != "" {
 		req.Header.Set("Range", byteRange)
 		req.Header.Set("Accept-Encoding", "identity")
@@ -59,7 +82,7 @@ func getHTTP(ctx context.Context, url, byteRange string) (*http.Response, error)
 	}
 	if res.StatusCode != http.StatusOK && !(byteRange != "" && res.StatusCode == http.StatusPartialContent) {
 		res.Body.Close()
-		return nil, httpFailure{host: req.URL.Host, status: res.StatusCode}
+		return nil, httpFailure{host: res.Request.URL.Host, status: res.StatusCode}
 	}
 	return res, nil
 }

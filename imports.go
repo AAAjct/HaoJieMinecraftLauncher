@@ -16,45 +16,76 @@ type importRequest struct {
 	mods, packs []string
 }
 
-func (a *app) receiveFiles(paths []string) {
-	if a.importConfirm {
-		a.status = "请先处理当前的导入确认。"
-		return
-	}
-	request := importRequest{instance: a.current()}
+func splitImportFiles(paths []string) importRequest {
+	var request importRequest
 	for _, path := range paths {
 		switch strings.ToLower(filepath.Ext(path)) {
 		case ".jar":
 			request.mods = append(request.mods, path)
-		case ".mrpack", ".zip":
+		case ".mrpack", ".zip", ".rar":
 			request.packs = append(request.packs, path)
 		}
 	}
+	return request
+}
+
+func (a *app) receiveFiles(paths []string) {
+	request := splitImportFiles(paths)
+	request.instance = a.current()
+	hasPacks := len(request.packs) > 0
+	if hasPacks {
+		a.installFiles(importRequest{packs: request.packs})
+		request.packs = nil
+	}
 	if len(request.mods) > 0 {
+		if a.importConfirm {
+			a.status = "请先处理当前的模组导入确认。"
+			return
+		}
 		if request.instance.ID == "" || a.gameInUse(request.instance) {
 			a.status = "请先选中一个当前可修改的实例，再导入模组。"
 			return
 		}
 		a.pendingImport = request
 		a.importConfirm = true
-	} else if len(request.packs) > 0 {
-		a.installFiles(request)
-	} else {
-		a.status = "可拖入 JAR 模组或 Modrinth 整合包。"
+	} else if !hasPacks {
+		a.status = "可拖入 JAR 模组或 MRPACK、ZIP、RAR 整合包。"
 	}
 }
 
-func (a *app) chooseFiles() {
+func (a *app) chooseMods(target engine.Instance) {
+	a.chooseFiles("安装模组", mygo.FileFilter{Name: "JAR 模组", Extensions: []string{"jar"}}, func(paths []string) {
+		mods := splitImportFiles(paths).mods
+		if len(mods) == 0 {
+			a.status = "请选择 JAR 模组文件。"
+			return
+		}
+		a.installFiles(importRequest{instance: target, mods: mods})
+	})
+}
+
+func (a *app) choosePacks() {
+	a.chooseFiles("导入整合包", mygo.FileFilter{Name: "整合包", Extensions: []string{"zip", "rar", "mrpack"}}, func(paths []string) {
+		packs := splitImportFiles(paths).packs
+		if len(packs) == 0 {
+			a.status = "请选择 ZIP、RAR 或 MRPACK 整合包。"
+			return
+		}
+		a.installFiles(importRequest{packs: packs})
+	})
+}
+
+func (a *app) chooseFiles(title string, filter mygo.FileFilter, selected func([]string)) {
 	go func() {
 		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
-			Parent: a.window, Title: "从文件安装", Multiple: true,
-			Filters: []mygo.FileFilter{{Name: "模组与整合包", Extensions: []string{"jar", "mrpack", "zip"}}},
+			Parent: a.window, Title: title, Multiple: true,
+			Filters: []mygo.FileFilter{filter},
 		})
 		a.window.Update(func() {
 			if err != nil {
 				a.status = err.Error()
 			} else if len(paths) > 0 {
-				a.receiveFiles(paths)
+				selected(paths)
 			}
 		})
 	}()

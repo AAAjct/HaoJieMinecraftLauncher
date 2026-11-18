@@ -21,11 +21,14 @@ func groupResourceVersions(versions []engine.ResourceVersion, catalog []engine.V
 	index := map[loaderKey]int{}
 	for _, version := range versions {
 		loaders := version.Loaders
-		if len(loaders) == 0 || kind == "datapack" || kind == "resourcepack" {
+		if resourceIgnoresLoader(kind) || (kind == "modpack" && len(loaders) == 0) {
 			loaders = []string{""}
 		}
 		for _, game := range version.GameVersions {
 			for _, loader := range loaders {
+				if loader != "" && loader != "minecraft" && !engine.SupportedModLoader(loader) {
+					continue
+				}
 				key := loaderKey{game, loader}
 				i, exists := index[key]
 				if !exists {
@@ -66,22 +69,34 @@ func resourceIgnoresLoader(kind string) bool {
 }
 
 func (a *app) fetchProjectIcons(projects []engine.Project) {
+	if a.cancelProjectIcons != nil {
+		a.cancelProjectIcons()
+	}
+	ctx, cancel := context.WithTimeout(a.catalogContext, 15*time.Second)
+	a.cancelProjectIcons = cancel
+	previous := a.projectIcons
+	a.projectIcons = make(map[string]ui.ImageSource, len(projects))
 	for _, project := range projects {
 		source := project.IconURL
-		if _, cached := a.projectIcons[source]; source == "" || cached {
+		if _, pending := a.projectIcons[source]; source == "" || pending {
 			continue
 		}
-		a.projectIcons[source] = nil
+		a.projectIcons[source] = previous[source]
+		if previous[source] != nil {
+			continue
+		}
 		go func() {
-			ctx, cancel := context.WithTimeout(a.catalogContext, 15*time.Second)
-			defer cancel()
 			data, err := engine.ProjectIcon(ctx, source)
 			if err != nil {
 				return
 			}
-			icon, err := ui.DecodeBitmapScaled(data, 96)
-			if err == nil && a.catalogContext.Err() == nil {
-				a.window.Update(func() { a.projectIcons[source] = icon })
+			icon, err := ui.DecodeBitmapScaled(data, 64)
+			if err == nil && ctx.Err() == nil {
+				a.window.Update(func() {
+					if ctx.Err() == nil {
+						a.projectIcons[source] = icon
+					}
+				})
 			}
 		}()
 	}
@@ -105,12 +120,6 @@ func (a *app) projectIcon(c *ui.Context, project engine.Project, size float32) {
 
 func resourceLoaderName(loader string) string {
 	switch loader {
-	case "iris":
-		return "Iris"
-	case "optifine":
-		return "OptiFine"
-	case "neoforge":
-		return "NeoForge"
 	case "", "minecraft":
 		return "原版"
 	}
@@ -159,34 +168,48 @@ func (a *app) downloadView(c *ui.Context) {
 	busy := a.busy(catalogJob)
 	panel(c).Children(func() {
 		ui.Row(c).Gap(8).Children(func() {
+			source := state.source
+			if source == "" {
+				source = "Modrinth"
+			}
+			changed := ui.Select(c, &source, []string{"Modrinth", "CurseForge"}).Width(135).Label("资源来源").Disabled(busy).Changed()
 			input := ui.TextInput(c, &state.query).Label("搜索" + a.resourceKind).
 				Placeholder("搜索" + a.resourceKind).Grow(1)
-			if ui.PrimaryButton(c, "搜索").Width(72).Clicked() || input.Submitted() {
+			search := ui.PrimaryButton(c, "搜索").Width(72).Clicked() || input.Submitted()
+			if changed {
+				state.source = source
+				if state.source == "Modrinth" {
+					state.source = ""
+				}
+				if source == "CurseForge" && state.game == "" {
+					state.loader = ""
+				}
+			}
+			if changed || search {
 				a.submitResourceSearch(state)
+			}
+			if a.kind() == "modpack" && ui.Button(c, "从文件安装").Clicked() {
+				a.choosePacks()
 			}
 		})
 		var games, loaders []string
 		for _, v := range a.versionList {
 			games = append(games, v.ID)
 		}
-		for _, loader := range a.resourceLoaders {
-			if slices.Contains(loader.ProjectTypes, a.kind()) {
-				loaders = append(loaders, loader.Name)
-			}
-		}
-		if len(loaders) == 0 {
-			loaders = []string{"fabric", "forge", "neoforge", "quilt"}
-			if a.kind() == "shader" {
-				loaders = []string{"iris", "optifine"}
-			}
+		for _, loader := range loaderOptions {
+			loaders = append(loaders, loader.id)
 		}
 		ui.Row(c).Gap(8).Children(func() {
 			ui.Text(c, "游戏版本").FontSize(13)
 			gameChanged := resourceFilter(c, "筛选游戏版本", &state.game, games, func(s string) string { return s }, busy)
 			var loaderChanged bool
-			if a.kind() != "datapack" && a.kind() != "resourcepack" {
+			if !resourceIgnoresLoader(a.kind()) {
 				ui.Text(c, "加载器").FontSize(13)
-				loaderChanged = resourceFilter(c, "筛选加载器", &state.loader, loaders, resourceLoaderName, busy)
+				if state.source == "CurseForge" && state.game == "" {
+					state.loader = ""
+				}
+				loaderChanged = resourceFilter(c, "筛选加载器", &state.loader, loaders, resourceLoaderName,
+					busy || state.source == "CurseForge" && state.game == "")
 			}
 			if gameChanged || loaderChanged {
 				a.submitResourceSearch(state)
@@ -288,8 +311,7 @@ func (a *app) resourceRow(c *ui.Context, project engine.Project, busy bool) {
 func (a *app) resourceSummary(project engine.Project) string {
 	var info, loaders []string
 	for _, category := range project.Categories {
-		if slices.ContainsFunc(a.resourceLoaders, func(loader engine.ResourceLoader) bool { return loader.Name == category }) ||
-			slices.Contains([]string{"fabric", "forge", "neoforge", "quilt", "iris", "optifine"}, category) {
+		if engine.SupportedModLoader(category) {
 			loaders = append(loaders, resourceLoaderName(category))
 		}
 	}
@@ -352,26 +374,53 @@ func (a *app) resourceDetails(c *ui.Context) {
 			seenGames[game] = true
 			games = append(games, game)
 		}
-		if loader := group.key.loader; loader != "" && !seenLoaders[loader] {
+		if loader := group.key.loader; engine.SupportedModLoader(loader) && !seenLoaders[loader] {
 			seenLoaders[loader] = true
 			loaders = append(loaders, loader)
 		}
 	}
-	if !seenGames[a.fileGame] {
-		a.fileGame = ""
-	}
-	if !seenLoaders[a.fileLoader] {
-		a.fileLoader = ""
-	}
 	kind := a.kind()
+	curse := isCurseProject(a.project)
+	busy := a.busy(catalogJob)
+	if curse {
+		for _, version := range a.versionList {
+			if !seenGames[version.ID] {
+				games = append(games, version.ID)
+				seenGames[version.ID] = true
+			}
+		}
+		if a.fileGame != "" && !seenGames[a.fileGame] {
+			games = append(games, a.fileGame)
+		}
+		if !resourceIgnoresLoader(kind) {
+			loaders = nil
+			for _, loader := range loaderOptions {
+				loaders = append(loaders, loader.id)
+			}
+		}
+	} else {
+		if !seenGames[a.fileGame] {
+			a.fileGame = ""
+		}
+		if !seenLoaders[a.fileLoader] {
+			a.fileLoader = ""
+		}
+	}
 	var target engine.Instance
 	panel(c).Children(func() {
 		ui.Row(c).Gap(8).Children(func() {
+			game, loader := a.fileGame, a.fileLoader
 			ui.Text(c, "游戏版本").FontSize(13)
-			resourceFilter(c, "筛选文件的游戏版本", &a.fileGame, games, func(s string) string { return s }, false)
-			if kind != "datapack" && kind != "resourcepack" {
+			gameChanged := resourceFilter(c, "筛选文件的游戏版本", &game, games, func(s string) string { return s }, busy)
+			var loaderChanged bool
+			if !resourceIgnoresLoader(kind) {
 				ui.Text(c, "加载器").FontSize(13)
-				resourceFilter(c, "筛选文件的加载器", &a.fileLoader, loaders, resourceLoaderName, false)
+				loaderChanged = resourceFilter(c, "筛选文件的加载器", &loader, loaders, resourceLoaderName, busy)
+			}
+			if curse && (gameChanged || loaderChanged) {
+				a.loadCursePage(a.project, game, loader, 0)
+			} else {
+				a.fileGame, a.fileLoader = game, loader
 			}
 		})
 		if kind != "modpack" {
@@ -390,7 +439,7 @@ func (a *app) resourceDetails(c *ui.Context) {
 		panel(c).Key(group.key.game+"/"+group.key.loader).Padding(7, 12).Children(func() {
 			expanded := a.openResourceGroups[group.key]
 			title := resourceLoaderName(group.key.loader) + " " + group.key.game
-			if kind == "datapack" || kind == "resourcepack" {
+			if resourceIgnoresLoader(kind) {
 				title = "Minecraft " + group.key.game
 			}
 			if accordionHeader(c, fmt.Sprintf("%s（%d）", title, len(group.files)), expanded, false) {
@@ -442,6 +491,17 @@ func (a *app) resourceDetails(c *ui.Context) {
 	}
 	if !matched {
 		panel(c).Children(func() { ui.Text(c, "没有符合筛选条件的文件。").TextColor(a.theme.TextMuted) })
+	}
+	if curse && (a.projectPage > 0 || a.projectMore) {
+		ui.Row(c).AlignSelf(ui.Center).Gap(8).Children(func() {
+			if ui.Button(c, "上一页").Disabled(busy || a.projectPage == 0).Clicked() {
+				a.loadCursePage(a.project, a.fileGame, a.fileLoader, a.projectPage-1)
+			}
+			ui.Textf(c, "第 %d 页", a.projectPage+1)
+			if ui.Button(c, "下一页").Disabled(busy || !a.projectMore).Clicked() {
+				a.loadCursePage(a.project, a.fileGame, a.fileLoader, a.projectPage+1)
+			}
+		})
 	}
 }
 

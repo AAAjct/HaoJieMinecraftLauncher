@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
@@ -49,13 +50,55 @@ func firstCatalog[T any](ctx context.Context, sources ...catalogSource[T]) (T, e
 	return empty, last
 }
 
+func preferCatalog[T any](ctx context.Context, sources ...catalogSource[T]) (T, error) {
+	var failures error
+	for _, fetch := range sources {
+		if ctx.Err() != nil {
+			return *new(T), ctx.Err()
+		}
+		attempt, cancel := context.WithTimeout(ctx, 8*time.Second)
+		value, err := fetch(attempt)
+		cancel()
+		if err == nil {
+			return value, nil
+		}
+		failures = errors.Join(failures, err)
+	}
+	var empty T
+	return empty, failures
+}
+
+func mirroredJSON[T any](ctx context.Context, mirror, official string, out *T) error {
+	source := func(address string) catalogSource[T] {
+		return func(ctx context.Context) (T, error) {
+			var result T
+			err := catalogJSON(ctx, address, &result)
+			return result, err
+		}
+	}
+	value, err := preferCatalog(ctx, source(mirror), source(official))
+	if err == nil {
+		*out = value
+	}
+	return err
+}
+
 func catalogJSON(ctx context.Context, address string, out any) error {
-	res, err := get(ctx, address)
+	return catalogRequest(ctx, http.MethodGet, address, nil, out)
+}
+
+func catalogRequest(ctx context.Context, method, address string, request io.Reader, out any) error {
+	res, err := requestHTTP(ctx, method, address, "", request)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
-	return json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(out)
+	body := io.LimitReader(res.Body, 8<<20)
+	if err := json.NewDecoder(body).Decode(out); err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, body)
+	return nil
 }
 
 func (e Engine) catalogPath(name string) string {

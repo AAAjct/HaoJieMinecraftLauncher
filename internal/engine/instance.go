@@ -198,6 +198,9 @@ func (e Engine) instanceMetadata(instance Instance) (string, Instance, error) {
 }
 
 func (e Engine) Install(ctx context.Context, instance Instance, status func(string)) (Instance, error) {
+	if instance.Loader != "" && !SupportedModLoader(instance.Loader) {
+		return Instance{}, fmt.Errorf("不提供 %s 加载器下载", instance.Loader)
+	}
 	return e.createInstance(ctx, instance, nil, status)
 }
 

@@ -22,17 +22,26 @@ type LoaderBuild struct {
 
 type loaderCatalogRow struct{ Loader LoaderBuild }
 
+var modLoaders = []string{"fabric", "forge", "neoforge"}
+
+func SupportedModLoader(loader string) bool {
+	return slices.Contains(modLoaders, loader)
+}
+
 func LoaderBuilds(ctx context.Context, version, loader string) ([]LoaderBuild, error) {
 	if !segment(version) {
 		return nil, fmt.Errorf("无效的 Minecraft 版本")
 	}
-	if loader == "forge" {
+	switch loader {
+	case "forge":
 		return forgeBuilds(ctx, version)
+	case "neoforge":
+		return neoForgeBuilds(ctx, version)
+	}
+	if !SupportedModLoader(loader) {
+		return nil, fmt.Errorf("不提供 %s 加载器下载", loader)
 	}
 	base := loaderURL(loader)
-	if base == "" {
-		return nil, fmt.Errorf("未知加载器 %s", loader)
-	}
 	source := func(base string) catalogSource[[]loaderCatalogRow] {
 		return func(ctx context.Context) ([]loaderCatalogRow, error) {
 			var rows []loaderCatalogRow
@@ -42,9 +51,9 @@ func LoaderBuilds(ctx context.Context, version, loader string) ([]LoaderBuild, e
 	}
 	sources := []catalogSource[[]loaderCatalogRow]{source(base)}
 	if loader == "fabric" {
-		sources = append(sources, source(bmcl+"/fabric-meta/v2/versions/loader/"))
+		sources = append([]catalogSource[[]loaderCatalogRow]{source(bmcl + "/fabric-meta/v2/versions/loader/")}, sources...)
 	}
-	response, err := firstCatalog(ctx, sources...)
+	response, err := preferCatalog(ctx, sources...)
 	if err != nil {
 		var failure httpFailure
 		if errors.As(err, &failure) && failure.status == http.StatusNotFound {
@@ -60,9 +69,6 @@ func LoaderBuilds(ctx context.Context, version, loader string) ([]LoaderBuild, e
 			continue
 		}
 		seen[build.Version] = true
-		if loader == "quilt" {
-			build.Stable = !strings.Contains(build.Version, "-")
-		}
 		builds = append(builds, build)
 	}
 	sortLoaderBuilds(builds)
@@ -78,7 +84,11 @@ func sortLoaderBuilds(builds []LoaderBuild) {
 func compareBuild(a, b string) int {
 	aCore, aPre, _ := strings.Cut(a, "-")
 	bCore, bPre, _ := strings.Cut(b, "-")
-	if result := goversion.Compare("go"+aCore, "go"+bCore); result != 0 {
+	result := goversion.Compare("go"+aCore, "go"+bCore)
+	if !goversion.IsValid("go"+aCore) || !goversion.IsValid("go"+bCore) {
+		result = compareBuildParts(aCore, bCore)
+	}
+	if result != 0 {
 		return result
 	}
 	if aPre == bPre {
@@ -90,7 +100,11 @@ func compareBuild(a, b string) int {
 	if bPre == "" {
 		return -1
 	}
-	return slices.CompareFunc(strings.Split(aPre, "."), strings.Split(bPre, "."), func(a, b string) int {
+	return compareBuildParts(aPre, bPre)
+}
+
+func compareBuildParts(a, b string) int {
+	return slices.CompareFunc(strings.Split(a, "."), strings.Split(b, "."), func(a, b string) int {
 		aNumber, aErr := strconv.Atoi(a)
 		bNumber, bErr := strconv.Atoi(b)
 		if aErr == nil && bErr == nil {
@@ -126,7 +140,7 @@ func forgeBuilds(ctx context.Context, version string) ([]LoaderBuild, error) {
 		}
 		return forgeBuildsForGame(version, coordinates), err
 	}
-	builds, err := firstCatalog(ctx, official, mirror)
+	builds, err := preferCatalog(ctx, mirror, official)
 	if err != nil {
 		return nil, fmt.Errorf("读取 Forge 构建：%w", err)
 	}

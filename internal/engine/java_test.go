@@ -9,6 +9,23 @@ import (
 	"testing"
 )
 
+func TestLauncherJavaMajors(t *testing.T) {
+	for _, test := range []struct{ required, want int }{
+		{0, 8}, {8, 8}, {16, 17}, {17, 17}, {21, 21}, {25, 25},
+	} {
+		if got, err := launcherJavaMajor(test.required); err != nil || got != test.want {
+			t.Errorf("Java %d: got %d, %v; want %d", test.required, got, err, test.want)
+		}
+	}
+	e := Engine{JavaRoot: filepath.Join(t.TempDir(), "jdk")}
+	if _, err := e.EnsureJava(t.Context(), 26, func(string) { t.Fatal("unexpected download") }); err == nil {
+		t.Fatal("Java 26 should be rejected before querying Azul")
+	}
+	if _, err := os.Stat(e.JavaRoot); !os.IsNotExist(err) {
+		t.Fatalf("unsupported runtime created a JDK directory: %v", err)
+	}
+}
+
 func TestExtractJDK(t *testing.T) {
 	for _, entry := range []string{"zulu/bin/java.exe", "../outside"} {
 		t.Run(entry, func(t *testing.T) {
