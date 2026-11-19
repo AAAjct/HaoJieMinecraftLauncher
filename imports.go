@@ -111,23 +111,48 @@ func (a *app) installFiles(request importRequest) {
 				return nil, err
 			}
 		}
-		var installed engine.Instance
-		for _, path := range request.packs {
-			pack, err := a.engine.ImportPack(ctx, path, status)
-			if err != nil {
-				return nil, fmt.Errorf("%s：%w", filepath.Base(path), err)
-			}
-			installed = pack
+		installed, err := importPacks(ctx, request.packs, a.engine.ImportPack, status)
+		if err != nil {
+			return nil, err
 		}
 		return func() {
-			if installed.ID != "" {
-				a.installed(installed)
+			if len(installed) > 0 {
+				a.installed(installed[len(installed)-1])
+				if len(installed) > 1 {
+					a.status = fmt.Sprintf("已安装 %d 个整合包", len(installed))
+				}
 			} else {
 				a.refreshMods()
 				a.status = fmt.Sprintf("已安装 %d 个模组 · %s", len(request.mods), request.instance.Name)
 			}
 		}, nil
 	})
+}
+
+func importPacks(ctx context.Context, paths []string, importPack func(context.Context, string, func(string)) (engine.Instance, error), status func(string)) ([]engine.Instance, error) {
+	var installed []engine.Instance
+	var failures []string
+	for index, path := range paths {
+		if err := ctx.Err(); err != nil {
+			return installed, err
+		}
+		name := filepath.Base(path)
+		pack, err := importPack(ctx, path, func(message string) {
+			status(fmt.Sprintf("整合包 %d/%d · %s · %s", index+1, len(paths), name, message))
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return installed, err
+			}
+			failures = append(failures, fmt.Sprintf("%s：%v", name, err))
+			continue
+		}
+		installed = append(installed, pack)
+	}
+	if len(failures) > 0 {
+		return installed, fmt.Errorf("已安装 %d/%d 个整合包，失败：%s", len(installed), len(paths), strings.Join(failures, "；"))
+	}
+	return installed, nil
 }
 
 func (a *app) importDialog(c *ui.Context) {
