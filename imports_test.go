@@ -1,59 +1,37 @@
 package main
 
 import (
-	"context"
-	"errors"
-	"slices"
-	"strings"
+	"path/filepath"
 	"testing"
 
+	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/ui"
 	"hjml/internal/engine"
 )
 
-func TestImportPacksProcessesEntireBatch(t *testing.T) {
-	for _, paths := range [][]string{
-		{"first.mrpack", "second.zip"},
-		{"broken.rar", "first.mrpack", "second.zip"},
-		{"first.mrpack", "broken.rar", "second.zip"},
-	} {
-		t.Run(strings.Join(paths, "+"), func(t *testing.T) {
-			var attempted, progress []string
-			installed, err := importPacks(t.Context(), splitImportFiles(paths).packs,
-				func(_ context.Context, path string, status func(string)) (engine.Instance, error) {
-					attempted = append(attempted, path)
-					status("正在读取整合包清单…")
-					if path == "broken.rar" {
-						return engine.Instance{}, errors.New("测试用损坏文件")
-					}
-					return engine.Instance{ID: path}, nil
-				}, func(message string) { progress = append(progress, message) })
-			if !slices.Equal(attempted, paths) || len(installed) != 2 ||
-				installed[0].ID != "first.mrpack" || installed[1].ID != "second.zip" {
-				t.Fatalf("attempted %v, installed %v", attempted, installed)
-			}
-			if len(progress) != len(paths) || !strings.Contains(progress[len(paths)-1], "second.zip") {
-				t.Fatalf("unexpected progress: %v", progress)
-			}
-			if len(paths) == 2 && err != nil ||
-				len(paths) == 3 && (err == nil || !strings.Contains(err.Error(), "2/3") || !strings.Contains(err.Error(), "broken.rar")) {
-				t.Fatalf("unexpected batch error: %v", err)
-			}
-		})
+func TestDroppedPacksHaveSeparateTaskRows(t *testing.T) {
+	dir := t.TempDir()
+	a := newApp(engine.Engine{DataDir: dir})
+	a.window = &mygo.Window{}
+	a.receiveFiles([]string{filepath.Join(dir, "first.mrpack"), filepath.Join(dir, "second.zip")})
+	if a.downloadCount() != 2 {
+		t.Fatalf("two packs created %d download tasks", a.downloadCount())
 	}
-}
-
-func TestImportPacksStopsOnCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	installed, err := importPacks(ctx, []string{"first.zip", "second.zip"},
-		func(_ context.Context, path string, _ func(string)) (engine.Instance, error) {
-			if path != "first.zip" {
-				t.Fatalf("imported %s after cancellation", path)
-			}
-			cancel()
-			return engine.Instance{ID: path}, nil
-		}, func(string) {})
-	if len(installed) != 1 || !errors.Is(err, context.Canceled) {
-		t.Fatalf("installed %v, error %v", installed, err)
+	t.Cleanup(func() {
+		for _, task := range a.jobs {
+			task.cancel()
+		}
+	})
+	test := ui.NewTester(func(c *ui.Context) {
+		ui.Column(c).Gap(8).Children(func() { a.taskView(c) })
+	}, 1020, 675)
+	if !test.HasText("first.mrpack") || !test.HasText("second.zip") {
+		t.Fatalf("missing pack task rows: %v", test.Texts())
+	}
+	if err := test.Click("取消 first.mrpack"); err != nil {
+		t.Fatal(err)
+	}
+	if !a.jobs[0].cancelling || a.jobs[1].cancelling {
+		t.Fatal("cancelling the first pack affected the second pack")
 	}
 }

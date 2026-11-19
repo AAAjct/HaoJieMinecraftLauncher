@@ -38,9 +38,11 @@ func recommendedForge(ctx context.Context, version string) (string, error) {
 func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gameProfile, status func(string)) (gameProfile, error) {
 	var overlay gameProfile
 	name, artifactName, repository := "Forge", "forge", forgeMaven
+	group := "net/minecraftforge"
 	build := i.Version + "-" + i.Build
 	if i.Loader == "neoforge" {
 		name = "NeoForge"
+		group = "net/neoforged"
 		artifactName = neoForgeArtifact(i.Version)
 		repository = neoForgeMaven + artifactName + "/"
 		if !neoForgeMatches(i.Version, i.Build) {
@@ -52,9 +54,15 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	} else if !forgeBuild.MatchString(i.Build) {
 		return overlay, fmt.Errorf("Forge 构建版本无效")
 	}
-	addr := repository + build + "/" + artifactName + "-" + build + "-installer.jar"
-	cacheRoot := filepath.Join(e.gameRoot(), i.Loader)
-	installer := filepath.Join(cacheRoot, build+"-installer.jar")
+	prefix := artifactName + "-" + build
+	addr := repository + build + "/" + prefix + "-installer.jar"
+	shared := filepath.Join(e.gameRoot(), "libraries")
+	cacheBuild := build
+	if i.Loader == "neoforge" {
+		cacheBuild = i.Build
+	}
+	cacheRoot := filepath.Join(shared, group, i.Loader, cacheBuild)
+	installer := filepath.Join(cacheRoot, prefix+"-installer.jar")
 	status("下载 " + name + " 安装器 · " + i.Build)
 	if err := downloadForgeInstaller(ctx, addr, installer); err != nil {
 		return overlay, fmt.Errorf("下载 %s 安装器：%w", name, err)
@@ -110,7 +118,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		return overlay, err
 	}
 	status("正在执行 " + name + " 安装处理器…")
-	if err := runForgeInstaller(ctx, name, java, installer, stage, filepath.Join(cacheRoot, build+"-install-*.log"), status); err != nil {
+	if err := runForgeInstaller(ctx, name, java, installer, stage, filepath.Join(cacheRoot, prefix+"-install-*.log"), status); err != nil {
 		return overlay, err
 	}
 	if err := readJSON(filepath.Join(stage, "versions", overlay.ID, overlay.ID+".json"), &overlay); err != nil {
@@ -127,7 +135,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(e.gameRoot(), "libraries", relative)
+		target := filepath.Join(shared, relative)
 		if regularFile(target) {
 			return nil
 		}

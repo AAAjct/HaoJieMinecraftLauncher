@@ -100,6 +100,7 @@ type job struct {
 	target     string
 	message    string
 	cancel     context.CancelFunc
+	onDone     func(error)
 	cancelling bool
 	superseded bool
 }
@@ -354,6 +355,9 @@ func (a *app) startJob(task *job, work operation) {
 				}
 			} else if finish != nil {
 				finish()
+			}
+			if task.onDone != nil {
+				task.onDone(err)
 			}
 		})
 	}()

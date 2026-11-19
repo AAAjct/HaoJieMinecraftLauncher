@@ -92,67 +92,60 @@ func (a *app) chooseFiles(title string, filter mygo.FileFilter, selected func([]
 }
 
 func (a *app) installFiles(request importRequest) {
-	if len(request.mods) > 0 && a.gameInUse(request.instance) {
+	a.installPacks(request.packs)
+	if len(request.mods) == 0 {
+		return
+	}
+	if a.gameInUse(request.instance) {
 		a.status = "目标实例正在启动或运行，请稍后重试。"
 		return
 	}
-	target := ""
-	if len(request.mods) > 0 {
-		target = request.instance.ID
-	}
-	kind := downloadJob
-	if len(request.packs) == 0 {
-		kind = importJob
-	}
-	a.startJob(&job{kind: kind, title: "从文件安装", target: target, message: "正在读取本地文件…"}, func(ctx context.Context, status func(string)) (func(), error) {
-		if len(request.mods) > 0 {
-			status("正在安装模组 · " + request.instance.Name)
-			if err := a.engine.InstallLocalMods(ctx, request.instance, request.mods); err != nil {
-				return nil, err
-			}
-		}
-		installed, err := importPacks(ctx, request.packs, a.engine.ImportPack, status)
-		if err != nil {
+	a.startJob(&job{kind: importJob, title: "从文件安装", target: request.instance.ID, message: "正在读取本地文件…"}, func(ctx context.Context, status func(string)) (func(), error) {
+		status("正在安装模组 · " + request.instance.Name)
+		if err := a.engine.InstallLocalMods(ctx, request.instance, request.mods); err != nil {
 			return nil, err
 		}
 		return func() {
-			if len(installed) > 0 {
-				a.installed(installed[len(installed)-1])
-				if len(installed) > 1 {
-					a.status = fmt.Sprintf("已安装 %d 个整合包", len(installed))
-				}
-			} else {
-				a.refreshMods()
-				a.status = fmt.Sprintf("已安装 %d 个模组 · %s", len(request.mods), request.instance.Name)
-			}
+			a.refreshMods()
+			a.status = fmt.Sprintf("已安装 %d 个模组 · %s", len(request.mods), request.instance.Name)
 		}, nil
 	})
 }
 
-func importPacks(ctx context.Context, paths []string, importPack func(context.Context, string, func(string)) (engine.Instance, error), status func(string)) ([]engine.Instance, error) {
-	var installed []engine.Instance
+func (a *app) installPacks(paths []string) {
+	var finished, installed, canceled int
 	var failures []string
-	for index, path := range paths {
-		if err := ctx.Err(); err != nil {
-			return installed, err
-		}
-		name := filepath.Base(path)
-		pack, err := importPack(ctx, path, func(message string) {
-			status(fmt.Sprintf("整合包 %d/%d · %s · %s", index+1, len(paths), name, message))
-		})
-		if err != nil {
-			if ctx.Err() != nil {
-				return installed, err
+	for _, path := range paths {
+		task := &job{kind: downloadJob, title: filepath.Base(path), message: "正在读取本地文件…"}
+		if len(paths) > 1 {
+			task.onDone = func(err error) {
+				finished++
+				if err == nil {
+					installed++
+				} else if _, cleanupFailed := err.(interface{ Unwrap() []error }); task.cancelling && !cleanupFailed {
+					canceled++
+				} else {
+					failures = append(failures, fmt.Sprintf("%s：%v", task.title, err))
+				}
+				if finished == len(paths) {
+					a.status = fmt.Sprintf("已安装 %d/%d 个整合包", installed, len(paths))
+					if canceled > 0 {
+						a.status += fmt.Sprintf("，已取消 %d 个", canceled)
+					}
+					if len(failures) > 0 {
+						a.status += "，失败：" + strings.Join(failures, "；")
+					}
+				}
 			}
-			failures = append(failures, fmt.Sprintf("%s：%v", name, err))
-			continue
 		}
-		installed = append(installed, pack)
+		a.startJob(task, func(ctx context.Context, status func(string)) (func(), error) {
+			pack, err := a.engine.ImportPack(ctx, path, status)
+			if err != nil {
+				return nil, err
+			}
+			return func() { a.installed(pack) }, nil
+		})
 	}
-	if len(failures) > 0 {
-		return installed, fmt.Errorf("已安装 %d/%d 个整合包，失败：%s", len(installed), len(paths), strings.Join(failures, "；"))
-	}
-	return installed, nil
 }
 
 func (a *app) importDialog(c *ui.Context) {

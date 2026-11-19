@@ -92,6 +92,41 @@ func TestNeoForgeInstallerFallsBackToForgeCDN(t *testing.T) {
 	}
 }
 
+func TestForgeFamilyCachesInstallersUnderLibraries(t *testing.T) {
+	const jar = "installer fixture"
+	previous := client.Transport
+	t.Cleanup(func() { client.Transport = previous })
+	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		body := jar
+		if strings.HasSuffix(req.URL.Path, ".sha1") {
+			body = fmt.Sprintf("%x", sha1.Sum([]byte(jar)))
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	for _, test := range []struct {
+		instance Instance
+		path     string
+	}{
+		{Instance{Loader: "forge", Version: "1.21.1", Build: "52.1.20"}, "net/minecraftforge/forge/1.21.1-52.1.20/forge-1.21.1-52.1.20-installer.jar"},
+		{Instance{Loader: "neoforge", Version: "1.21.1", Build: "21.1.264"}, "net/neoforged/neoforge/21.1.264/neoforge-21.1.264-installer.jar"},
+		{Instance{Loader: "neoforge", Version: "1.20.1", Build: "47.1.106"}, "net/neoforged/neoforge/47.1.106/forge-1.20.1-47.1.106-installer.jar"},
+	} {
+		t.Run(test.instance.Loader+"-"+test.instance.Version, func(t *testing.T) {
+			e := Engine{GameRoot: t.TempDir()}
+			if _, err := e.installForgeFamily(t.Context(), test.instance, gameProfile{}, func(string) {}); err == nil {
+				t.Fatal("non-ZIP fixture was accepted as an installer")
+			}
+			target := filepath.Join(e.GameRoot, "libraries", filepath.FromSlash(test.path))
+			if got, err := os.ReadFile(target); err != nil || string(got) != jar {
+				t.Fatalf("installer at %s = %q, err = %v", target, got, err)
+			}
+			if _, err := os.Stat(filepath.Join(e.GameRoot, test.instance.Loader)); !os.IsNotExist(err) {
+				t.Fatalf("unexpected loader directory in game root: %v", err)
+			}
+		})
+	}
+}
+
 func TestLiveLoaderCatalogs(t *testing.T) {
 	if os.Getenv("HJML_INTEGRATION") != "1" {
 		t.Skip("set HJML_INTEGRATION=1 to query the loader catalogs")
