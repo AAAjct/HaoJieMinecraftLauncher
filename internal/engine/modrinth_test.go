@@ -3,6 +3,7 @@ package engine
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -83,12 +84,32 @@ func TestPackImportCreatesIsolatedInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := e.ImportPack(t.Context(), path, func(string) {})
+	checkedDuringInstall := false
+	first, err := e.ImportPack(t.Context(), path, func(message string) {
+		if message == "正在读取整合包清单…" || checkedDuringInstall {
+			return
+		}
+		checkedDuringInstall = true
+		root := filepath.Join(e.GameRoot, "versions")
+		entries, err := os.ReadDir(root)
+		if err != nil || len(entries) != 1 || entries[0].Name() != "example" {
+			t.Errorf("versions during install = %v, err = %v, want only example", entries, err)
+		}
+		if installed, err := e.Instances(); err != nil || len(installed) != 0 {
+			t.Errorf("incomplete instance became visible: %v, err = %v", installed, err)
+		}
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.Name != "Fixture pack" || first.Java != 8 {
+	if first.Name != "Fixture pack" || first.ID != "example" || first.Java != 8 {
 		t.Fatalf("unexpected first instance: %+v", first)
+	}
+	if !checkedDuringInstall || !regularFile(e.baseVersionFile(version, ".jar")) {
+		t.Fatal("install did not use the named directory and migrated client cache")
+	}
+	if _, err := os.Stat(filepath.Join(e.GameDir(first), installingMarker)); !os.IsNotExist(err) {
+		t.Fatalf("finished instance has an installation marker: %v", err)
 	}
 	type result struct {
 		instance Instance
@@ -115,11 +136,18 @@ func TestPackImportCreatesIsolatedInstance(t *testing.T) {
 		!slices.ContainsFunc(instances, func(i Instance) bool { return i.Name == "Fixture pack(2)" }) {
 		t.Fatalf("concurrent installations did not allocate distinct names: %+v", instances)
 	}
+	if !slices.ContainsFunc(instances, func(i Instance) bool { return i.ID == "example(1)" }) {
+		t.Fatalf("same archive filename should get a unique directory: %+v", instances)
+	}
 	for _, instance := range instances {
 		if e.GameDir(instance) != filepath.Join(e.GameRoot, "versions", instance.ID) ||
 			!regularFile(filepath.Join(e.GameDir(instance), instance.ID+".jar")) ||
 			!regularFile(filepath.Join(e.GameDir(instance), instance.ID+".json")) {
 			t.Fatalf("incorrect portable layout: %s", e.GameDir(instance))
+		}
+		var profile gameProfile
+		if err := readJSON(filepath.Join(e.GameDir(instance), instance.ID+".json"), &profile); err != nil || profile.ID != instance.ID {
+			t.Fatalf("profile ID = %q, want %q, read error = %v", profile.ID, instance.ID, err)
 		}
 	}
 	content, err := os.ReadFile(filepath.Join(e.GameDir(first), "mods", "example.jar"))
@@ -186,7 +214,7 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := os.ReadFile(filepath.Join(e.GameDir(instance), "config", "test.txt"))
-	if err != nil || string(config) != "rar config" || instance.Name != "Curse fixture" {
+	if err != nil || string(config) != "rar config" || instance.Name != "Curse fixture" || instance.ID != "example" {
 		t.Fatalf("RAR import: %q, %+v, %v", config, instance, err)
 	}
 
@@ -250,7 +278,8 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	if err := z.Close(); err != nil {
 		t.Fatal(err)
 	}
-	zipPath := filepath.Join(dir, "example.zip")
+	const packStem = "DeceasedCraft_Beta-5.10.17"
+	zipPath := filepath.Join(dir, packStem+".zip")
 	if err := os.WriteFile(zipPath, archive.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -258,13 +287,62 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := os.ReadFile(filepath.Join(e.GameDir(instance), "mods", "mod.jar"))
-	if err != nil || string(result) != mod {
+	expectedDir := filepath.Join(e.GameRoot, "versions", packStem)
+	if dir := e.GameDir(instance); dir != expectedDir {
+		t.Fatalf("ZIP version directory = %q, want %q", dir, expectedDir)
+	}
+	if !regularFile(filepath.Join(expectedDir, packStem+".jar")) || !regularFile(filepath.Join(expectedDir, packStem+".json")) {
+		t.Fatalf("missing named launch files in %s", expectedDir)
+	}
+	result, err := os.ReadFile(filepath.Join(expectedDir, "mods", "mod.jar"))
+	if err != nil || string(result) != mod || instance.ID != packStem || instance.Name != "Curse ZIP" {
 		t.Fatalf("ZIP import: %q, %v", result, err)
 	}
 	result, err = os.ReadFile(filepath.Join(e.GameDir(instance), "mods", "web.jar"))
 	if err != nil || string(result) != webMod {
 		t.Fatalf("ZIP import through website: %q, %v", result, err)
+	}
+}
+
+func TestPackVersionIDHandlesWindowsPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"Integrated Boogaloo", "Integrated Boogaloo(1)"} {
+		if err := os.Mkdir(filepath.Join(root, name), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ title, want string }{
+		{"Integrated Boogaloo", "Integrated Boogaloo(2)"},
+		{"..\\My: Pack? ", "_My_ Pack_"},
+		{"CON", "_CON"},
+		{"instance", "_instance"},
+		{"1.21.1", "1.21.1"},
+		{strings.Repeat("整合包", 60), strings.Repeat("整合包", 60)},
+	} {
+		got, err := reservePackDirectory(root, tc.title)
+		if err != nil || got != filepath.Join(root, tc.want) {
+			t.Fatalf("%q: got %q, want %q, err = %v", tc.title, got, tc.want, err)
+		}
+	}
+}
+
+func TestCanceledPackRemovesItsNamedDirectory(t *testing.T) {
+	e := packTestEngine(t)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	_, err := e.createInstance(ctx, Instance{Version: "test-version"}, "Canceled Pack.zip", func(game string) error {
+		if filepath.Base(game) != "Canceled Pack" {
+			t.Errorf("pack downloaded into %s", game)
+		}
+		cancel(ErrTaskCanceled)
+		return ctx.Err()
+	}, func(string) {})
+	if err == nil {
+		t.Fatal("canceled import succeeded")
+	}
+	dirs, err := os.ReadDir(filepath.Join(e.GameRoot, "versions"))
+	if err != nil || len(dirs) != 0 {
+		t.Fatalf("canceled import left directories %v, err = %v", dirs, err)
 	}
 }
 

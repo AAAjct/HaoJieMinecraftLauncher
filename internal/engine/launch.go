@@ -84,6 +84,29 @@ func expandArgs(raw []json.RawMessage, values *strings.Replacer) ([]string, erro
 	return args, nil
 }
 
+func expandJVMArgs(raw []json.RawMessage, values *strings.Replacer, versionName, clientJar string) ([]string, error) {
+	args, err := expandArgs(raw, values)
+	if err != nil {
+		return nil, err
+	}
+	const prefix = "-DignoreList="
+	for i, arg := range args {
+		list, ok := strings.CutPrefix(arg, prefix)
+		if !ok {
+			continue
+		}
+		// BootstrapLauncher matches the actual classpath filenames.
+		entries := strings.Split(list, ",")
+		for j, entry := range entries {
+			if entry == versionName+".jar" {
+				entries[j] = clientJar
+			}
+		}
+		args[i] = prefix + strings.Join(entries, ",")
+	}
+	return args, nil
+}
+
 type LaunchOptions struct {
 	Memory     int
 	Additional bool
@@ -182,11 +205,12 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		"${version_name}", versionName, "${version_type}", "HJML",
 		"${game_directory}", game, "${assets_root}", assets, "${game_assets}", gameAssets,
 		"${assets_index_name}", profile.AssetIndex.ID, "${natives_directory}", native,
-		"${launcher_name}", "HJML", "${launcher_version}", "1.0.5",
+		"${launcher_name}", "HJML", "${launcher_version}", "1.0.6",
 		"${library_directory}", filepath.Join(e.gameRoot(), "libraries"), "${classpath_separator}", ";",
 		"${classpath}", strings.Join(classpath, ";"),
 	)
-	jvmArgs, err := expandArgs(profile.Arguments.JVM, values)
+	clientJar := filepath.Base(e.baseVersionFile(profile.ID, ".jar"))
+	jvmArgs, err := expandJVMArgs(profile.Arguments.JVM, values, versionName, clientJar)
 	if err != nil {
 		return nil, err
 	}

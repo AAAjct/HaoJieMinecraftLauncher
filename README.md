@@ -25,14 +25,14 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 - 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge API 未返回下载地址时，会尝试通过 CurseForge 网站下载并校验文件。
 - 在 **实例管理 → 从文件安装** 可多选 JAR 模组。系统文件对话框确认后，模组会直接安装到打开对话框时选中的实例。直接拖入 JAR 时会显示目标实例确认。
 - **实例管理** 支持改名、打开目录、刷新模组、启用、禁用及删除。
-- 原版实例默认用 Minecraft 版本命名。带加载器的实例默认包含构建号，例如 `26.3-fabric_0.20.1`。安装、导入或改名时如果名称已被占用，会自动追加首个可用的 `(1)`、`(2)` 等编号。
+- 原版实例默认用 Minecraft 版本命名。手动安装带加载器的实例默认包含构建号，例如 `26.3-fabric_0.20.1`。整合包使用去掉扩展名的压缩包文件名作为版本目录及启动文件的名称。同名时会自动追加首个可用的 `(1)`、`(2)` 等编号。
 - 模组列表优先显示中文名，其次使用 JAR 内声明的名称。图标、版本、标签和描述取自本地模组元数据。中文名称与检索使用 [PCL Community 提供的 MCMOD 索引](https://github.com/PCL-Community/PCL-CE/blob/676a752d304165e8c5fd3729841f1582bbf4b795/Plain%20Craft%20Launcher%202/Resources/mcmod.buf)。
 
 ## 数据位置
 
 | 位置 | 内容 |
 | --- | --- |
-| EXE 同级的 `.minecraft/` | 共享运行库、资源缓存、续传文件和 `versions/<实例目录>/` 下的实例数据 |
+| EXE 同级的 `.minecraft/` | 共享运行库、资源缓存、`.hjml-cache/` 中的共享客户端与续传文件，以及 `versions/<实例目录>/` 下的实例数据 |
 | EXE 同级的 `jdk/zulu <主版本>/` | 自动安装的 Zulu JDK 8、17、21、25 |
 | `%LOCALAPPDATA%\HJML` | 启动器设置、版本目录缓存以及旧版实例 |
 | 实例目录的 `hjml-latest.log` | 最近一次游戏启动日志 |

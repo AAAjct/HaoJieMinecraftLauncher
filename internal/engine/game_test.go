@@ -2,12 +2,27 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestExpandJVMIgnoresActualMinecraftJar(t *testing.T) {
+	const versionName = "neoforge-21.1.264"
+	raw := []json.RawMessage{
+		json.RawMessage(`"-DignoreList=client-extra,${version_name}.jar,asm"`),
+		json.RawMessage(`"-Dother=${version_name}.jar"`),
+	}
+	args, err := expandJVMArgs(raw, strings.NewReplacer("${version_name}", versionName), versionName, "1.21.1.jar")
+	want := []string{"-DignoreList=client-extra,1.21.1.jar,asm", "-Dother=" + versionName + ".jar"}
+	if err != nil || !slices.Equal(args, want) {
+		t.Fatalf("JVM args = %v, %v; want %v", args, err, want)
+	}
+}
 
 func TestDefaultChineseOptions(t *testing.T) {
 	game := t.TempDir()
@@ -98,6 +113,24 @@ func TestCanceledInstallRemovesUnusedVersion(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(filepath.Dir(filepath.Dir(profilePath))); err != nil || len(entries) != 0 {
 		t.Fatalf("canceled installation left version or staging directories: %v (%v)", entries, err)
+	}
+}
+
+func TestLegacyVersionCacheMigrationPreservesInstanceDirectory(t *testing.T) {
+	e := packTestEngine(t)
+	version := "test-version"
+	dir := filepath.Join(e.GameRoot, "versions", version)
+	if err := writeJSON(filepath.Join(dir, "instance.json"), Instance{ID: version, Version: version}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.moveLegacyVersionCache(version); err != nil {
+		t.Fatal(err)
+	}
+	if !regularFile(filepath.Join(dir, "instance.json")) || !regularFile(filepath.Join(dir, version+".jar")) {
+		t.Fatal("migrating a cache moved a real instance")
+	}
+	if _, err := os.Stat(e.versionCacheDir(version)); !os.IsNotExist(err) {
+		t.Fatalf("unexpected cache directory: %v", err)
 	}
 }
 

@@ -13,16 +13,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 )
 
 var instancePublishMu sync.Mutex
 var versionLocks sync.Map
 
+const installingMarker = ".hjml-installing"
+
 func (e Engine) versionLock(instance Instance) *sync.RWMutex {
 	if instance.legacy {
 		e.GameRoot = ""
 	}
-	key := filepath.Join(e.gameRoot(), "versions", instance.Version)
+	key := e.versionCacheDir(instance.Version)
 	lock, _ := versionLocks.LoadOrStore(key, &sync.RWMutex{})
 	return lock.(*sync.RWMutex)
 }
@@ -78,9 +81,15 @@ func readInstances(root string, legacy bool) ([]Instance, error) {
 	}
 	var instances []Instance
 	for _, entry := range list {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if _, err := os.Lstat(filepath.Join(dir, installingMarker)); !os.IsNotExist(err) {
+			continue
+		}
 		var instance Instance
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") &&
-			readJSON(filepath.Join(root, entry.Name(), "instance.json"), &instance) == nil && instance.ID == entry.Name() {
+		if readJSON(filepath.Join(dir, "instance.json"), &instance) == nil && instance.ID == entry.Name() {
 			instance.legacy = legacy
 			instances = append(instances, instance)
 		}
@@ -201,10 +210,10 @@ func (e Engine) Install(ctx context.Context, instance Instance, status func(stri
 	if instance.Loader != "" && !SupportedModLoader(instance.Loader) {
 		return Instance{}, fmt.Errorf("不提供 %s 加载器下载", instance.Loader)
 	}
-	return e.createInstance(ctx, instance, nil, status)
+	return e.createInstance(ctx, instance, "", nil, status)
 }
 
-func (e Engine) createInstance(ctx context.Context, instance Instance, setup func(string) error, status func(string)) (_ Instance, installErr error) {
+func (e Engine) createInstance(ctx context.Context, instance Instance, archive string, setupPack func(string) error, status func(string)) (_ Instance, installErr error) {
 	lock := e.versionLock(instance)
 	lock.RLock()
 	defer func() {
@@ -236,11 +245,35 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return Instance{}, err
 	}
-	stage, err := os.MkdirTemp(root, ".install-")
+	directPack := e.GameRoot != "" && setupPack != nil
+	var stage string
+	var err error
+	if directPack {
+		if err := e.moveLegacyVersionCache(instance.Version); err != nil {
+			return Instance{}, err
+		}
+		filename := filepath.Base(archive)
+		stem := strings.TrimSuffix(filename, filepath.Ext(filename))
+		stage, err = reservePackDirectory(root, stem)
+		instance.ID = filepath.Base(stage)
+	} else {
+		stage, err = os.MkdirTemp(root, ".install-")
+	}
 	if err != nil {
 		return Instance{}, err
 	}
-	defer os.RemoveAll(stage)
+	defer func() {
+		if !directPack || installErr != nil {
+			if err := os.RemoveAll(stage); err != nil {
+				installErr = errors.Join(installErr, fmt.Errorf("清理安装目录：%w", err))
+			}
+		}
+	}()
+	if directPack {
+		if err := os.WriteFile(filepath.Join(stage, installingMarker), nil, 0600); err != nil {
+			return Instance{}, err
+		}
+	}
 	game := filepath.Join(stage, "game")
 	if e.GameRoot != "" {
 		game = stage
@@ -256,8 +289,8 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if _, err := e.EnsureJava(ctx, instance.Java, status); err != nil {
 		return Instance{}, err
 	}
-	if setup != nil {
-		if err := setup(game); err != nil {
+	if setupPack != nil {
+		if err := setupPack(game); err != nil {
 			return Instance{}, err
 		}
 	}
@@ -279,18 +312,22 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if err != nil {
 		return Instance{}, err
 	}
-	var id [12]byte
-	rand.Read(id[:])
-	idSuffix := hex.EncodeToString(id[:])
-	instance.ID = idSuffix
+	if !directPack {
+		var id [12]byte
+		rand.Read(id[:])
+		idSuffix := hex.EncodeToString(id[:])
+		instance.ID = idSuffix
+		if e.GameRoot != "" {
+			instance.ID = instance.Version + "-Vanilla"
+			if instance.Loader != "" {
+				instance.ID = instance.DefaultName()
+			}
+			if _, err := os.Stat(filepath.Join(root, instance.ID)); !os.IsNotExist(err) {
+				instance.ID += "-" + idSuffix[:8]
+			}
+		}
+	}
 	if e.GameRoot != "" {
-		instance.ID = instance.Version + "-Vanilla"
-		if instance.Loader != "" {
-			instance.ID = instance.DefaultName()
-		}
-		if _, err := os.Stat(filepath.Join(root, instance.ID)); !os.IsNotExist(err) {
-			instance.ID += "-" + idSuffix[:8]
-		}
 		if err := os.Link(e.baseVersionFile(instance.Version, ".jar"), filepath.Join(stage, instance.ID+".jar")); err != nil {
 			return Instance{}, err
 		}
@@ -303,10 +340,53 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, setup fun
 	if err := writeJSON(filepath.Join(stage, "instance.json"), instance); err != nil {
 		return Instance{}, err
 	}
-	if err := os.Rename(stage, filepath.Join(root, instance.ID)); err != nil {
+	if directPack {
+		err = os.Remove(filepath.Join(stage, installingMarker))
+	} else {
+		err = os.Rename(stage, filepath.Join(root, instance.ID))
+	}
+	if err != nil {
 		return Instance{}, err
 	}
 	return instance, nil
+}
+
+func reservePackDirectory(root, title string) (string, error) {
+	name := strings.Trim(strings.Map(func(r rune) rune {
+		if r < 32 || strings.ContainsRune(`<>:"/\|?*`, r) {
+			return '_'
+		}
+		return r
+	}, title), " .")
+	if name == "" {
+		name = "Modpack"
+	}
+	if !segment(name) || strings.EqualFold(name, "instance") {
+		name = "_" + name
+	}
+	for n := 0; ; n++ {
+		var suffix string
+		if n > 0 {
+			suffix = "(" + strconv.Itoa(n) + ")"
+		}
+		// Leave room for the version JSON extension in a Windows filename.
+		const maxStemUnits = 255 - len(".json")
+		candidate, units := name, len(suffix)
+		for offset, r := range name {
+			units += utf16.RuneLen(r)
+			if units > maxStemUnits {
+				candidate = strings.TrimRight(name[:offset], " .")
+				break
+			}
+		}
+		candidate += suffix
+		dir := filepath.Join(root, candidate)
+		if err := os.Mkdir(dir, 0700); err == nil {
+			return dir, nil
+		} else if !os.IsExist(err) {
+			return "", err
+		}
+	}
 }
 
 func defaultChinese(game, indexPath string) error {

@@ -218,7 +218,7 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 	if filepath.IsAbs(meta.Overrides) || !fs.ValidPath(meta.Overrides) || meta.Overrides == "." || strings.Contains(meta.Overrides, "\\") {
 		return Instance{}, fmt.Errorf("无效的 CurseForge 覆盖目录")
 	}
-	return e.createInstance(ctx, instance, func(game string) error {
+	return e.createInstance(ctx, instance, archive, func(game string) error {
 		status("正在读取 CurseForge 整合包文件…")
 		required := meta.Files[:0]
 		for _, entry := range meta.Files {

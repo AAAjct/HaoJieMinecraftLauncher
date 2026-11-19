@@ -148,6 +148,12 @@ func (e Engine) baseProfile(ctx context.Context, version string) (gameProfile, e
 	}
 	target := e.baseVersionFile(version, ".json")
 	if readJSON(target, &profile) != nil || profile.ID != version {
+		if err := e.moveLegacyVersionCache(version); err != nil {
+			return profile, err
+		}
+		if readJSON(target, &profile) == nil && profile.ID == version {
+			return validatedBaseProfile(profile, version)
+		}
 		versions, _ := e.CachedVersions()
 		var err error
 		if !slices.ContainsFunc(versions, func(entry Version) bool { return entry.ID == version }) {
@@ -175,6 +181,10 @@ func (e Engine) baseProfile(ctx context.Context, version string) (gameProfile, e
 			return profile, err
 		}
 	}
+	return validatedBaseProfile(profile, version)
+}
+
+func validatedBaseProfile(profile gameProfile, version string) (gameProfile, error) {
 	if profile.ID != version || profile.MainClass == "" || profile.Downloads.Client.URL == "" {
 		return profile, fmt.Errorf("版本 %s 没有可用客户端", version)
 	}
@@ -237,7 +247,7 @@ func (e Engine) profile(ctx context.Context, instance Instance, status func(stri
 	if (source == "" && !usesInstaller) || !segment(instance.Build) {
 		return base, fmt.Errorf("无效或不受支持的加载器")
 	}
-	cache := filepath.Join(e.gameRoot(), "versions", instance.Version, instance.Loader+"-"+instance.Build+".json")
+	cache := filepath.Join(e.versionCacheDir(instance.Version), instance.Loader+"-"+instance.Build+".json")
 	var overlay gameProfile
 	if readJSON(cache, &overlay) != nil {
 		if usesInstaller {
@@ -429,6 +439,63 @@ var assetHash = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func validAssetHash(s string) bool { return assetHash.MatchString(s) }
 
+func (e Engine) versionCacheDir(version string) string {
+	if e.GameRoot == "" {
+		return filepath.Join(e.gameRoot(), "versions", version)
+	}
+	return filepath.Join(e.GameRoot, ".hjml-cache", "versions", version)
+}
+
+func (e Engine) moveLegacyVersionCache(version string) error {
+	if e.GameRoot == "" {
+		return nil
+	}
+	instancePublishMu.Lock()
+	defer instancePublishMu.Unlock()
+	target := e.versionCacheDir(version)
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		return err
+	}
+	old := filepath.Join(e.GameRoot, "versions", version)
+	info, err := os.Lstat(old)
+	if os.IsNotExist(err) || err == nil && !info.IsDir() {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(old)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			return nil
+		}
+		name := entry.Name()
+		if name == version+".jar" || name == version+".json" {
+			continue
+		}
+		loader, _, ok := strings.Cut(name, "-")
+		if !ok || !strings.HasSuffix(name, ".json") || (loader != "forge" && loader != "neoforge" && loaderURL(loader) == "") {
+			return nil
+		}
+		var overlay gameProfile
+		if readJSON(filepath.Join(old, name), &overlay) != nil || overlay.InheritsFrom != version {
+			return nil
+		}
+	}
+	var base gameProfile
+	if readJSON(filepath.Join(old, version+".json"), &base) != nil || base.ID != version ||
+		base.MainClass == "" || base.Downloads.Client.URL == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
+		return err
+	}
+	return os.Rename(old, target)
+}
+
 func (e Engine) baseVersionFile(version, extension string) string {
 	name := version + extension
 	if e.GameRoot == "" {
@@ -437,5 +504,5 @@ func (e Engine) baseVersionFile(version, extension string) string {
 			name = "client.jar"
 		}
 	}
-	return filepath.Join(e.gameRoot(), "versions", version, name)
+	return filepath.Join(e.versionCacheDir(version), name)
 }

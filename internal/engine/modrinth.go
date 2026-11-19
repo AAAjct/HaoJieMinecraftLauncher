@@ -457,7 +457,7 @@ func (e Engine) importModrinthPack(ctx context.Context, archive, root string, da
 			return Instance{}, fmt.Errorf("该整合包要求当前版本尚未支持的 %s 加载器", id)
 		}
 	}
-	return e.createInstance(ctx, instance, func(game string) error {
+	return e.createInstance(ctx, instance, archive, func(game string) error {
 		if err := installPackFiles(ctx, game, index, status); err != nil {
 			return err
 		}
