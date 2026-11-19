@@ -104,11 +104,16 @@ func TestResumeAcrossDownloadAttempts(t *testing.T) {
 			file := artifact{URL: server.URL, Size: size, SHA256: fmt.Sprintf("%x", sha256.Sum256(content))}
 			first := transfer{file, filepath.Join(t.TempDir(), "unfinished.bin")}
 			var received atomic.Int64
-			err := first.ensureWithProgress(ctx, func(n, _ int64) {
+			cache, lock, err := first.lockResumeCache(ctx)
+			if err != nil || lock == nil {
+				t.Fatalf("could not reserve test download cache: %v", err)
+			}
+			err = first.copyResumable(ctx, cache, func(n, _ int64) {
 				if received.Add(n) >= parts*block {
 					cancel()
 				}
 			})
+			lock.Close()
 			if err == nil || regularFile(first.target) || received.Load() < parts*block {
 				t.Fatalf("expected interrupted download after %d bytes: received %d, %v", parts*block, received.Load(), err)
 			}
@@ -153,14 +158,36 @@ func TestCancelTaskRemovesPartialDownload(t *testing.T) {
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("download temporary files remain: %v (%v)", entries, err)
 	}
-	entries, err = os.ReadDir(filepath.Join(e.DataDir, ".hjml-cache", "downloads"))
+	entries, err = os.ReadDir(filepath.Join(e.DataDir, ".hjm-cache", "temp"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			t.Fatalf("partial download cache remains: %s", entry.Name())
+	if len(entries) != 0 {
+		t.Fatalf("partial download cache remains: %v", entries)
+	}
+}
+
+func TestFailedDownloadRemovesPartialCache(t *testing.T) {
+	const size = 2 << 20
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(make([]byte, 64<<10))
+		w.(http.Flusher).Flush()
+	}))
+	defer server.Close()
+	e := Engine{GameRoot: t.TempDir()}
+	target := filepath.Join(e.GameRoot, "libraries", "file.jar")
+	file := transfer{artifact{URL: server.URL, Size: size, SHA256: fmt.Sprintf("%x", sha256.Sum256(make([]byte, size)))}, target}
+	if err := file.ensure(e.resumableDownloads(t.Context())); err == nil || regularFile(target) {
+		t.Fatalf("incomplete download was published: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(e.GameRoot, ".hjm-cache", "temp"))
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("cache after failed download: %v (%v)", entries, err)
 	}
 }
 

@@ -36,6 +36,7 @@ func recommendedForge(ctx context.Context, version string) (string, error) {
 }
 
 func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gameProfile, status func(string)) (gameProfile, error) {
+	ctx = e.resumableDownloads(ctx)
 	var overlay gameProfile
 	name, artifactName, repository := "Forge", "forge", forgeMaven
 	group := "net/minecraftforge"
@@ -86,7 +87,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	if err != nil {
 		return overlay, err
 	}
-	stage, err := os.MkdirTemp(cacheRoot, ".installer-")
+	stage, err := makeCacheStage(ctx, ".installer-")
 	if err != nil {
 		return overlay, err
 	}
@@ -95,6 +96,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		return overlay, err
 	}
 	jar := e.baseVersionFile(i.Version, ".jar")
+	status("正在准备 " + name + " 所需的 Minecraft 客户端…")
 	if err := (transfer{minecraftClient(base), jar}).ensure(ctx); err != nil {
 		return overlay, err
 	}
@@ -102,7 +104,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	if err := os.MkdirAll(vanilla, 0700); err != nil {
 		return overlay, err
 	}
-	if err := os.Link(jar, filepath.Join(vanilla, i.Version+".jar")); err != nil {
+	if err := linkOrCopy(jar, filepath.Join(vanilla, i.Version+".jar")); err != nil {
 		return overlay, err
 	}
 	description, err := os.ReadFile(e.baseVersionFile(i.Version, ".json"))
@@ -114,6 +116,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	}
 	libRoot := filepath.Join(stage, "libraries")
 	libraries := append(append(installProfile.Libraries, overlay.Libraries...), base.Libraries...)
+	status("正在准备 " + name + " 运行库…")
 	if err := e.prepareInstallerLibraries(ctx, &z.Reader, libRoot, libraries, status); err != nil {
 		return overlay, err
 	}
@@ -142,7 +145,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		if err := os.MkdirAll(filepath.Dir(target), 0700); err != nil {
 			return err
 		}
-		if err := os.Link(path, target); err != nil && !regularFile(target) {
+		if err := linkOrCopy(path, target); err != nil && !regularFile(target) {
 			return err
 		}
 		return nil
@@ -230,7 +233,7 @@ func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Read
 					if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 						return err
 					}
-					if err := os.Link(cache.target, path); err == nil {
+					if err := linkOrCopy(cache.target, path); err == nil {
 						continue
 					}
 				}
@@ -242,14 +245,23 @@ func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Read
 }
 
 func runForgeInstaller(ctx context.Context, name, java, installer, stage, logPath string, status func(string)) error {
+	temp, err := filepath.Abs(filepath.Join(stage, "tmp"))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(temp, 0700); err != nil {
+		return err
+	}
 	log, err := os.CreateTemp(filepath.Dir(logPath), filepath.Base(logPath))
 	if err != nil {
 		return err
 	}
 	defer log.Close()
 	logPath = log.Name()
-	cmd := exec.CommandContext(ctx, filepath.Join(java, "bin", "java.exe"), "-Djava.awt.headless=true", "-jar", installer, "--installClient", stage)
+	cmd := exec.CommandContext(ctx, filepath.Join(java, "bin", "java.exe"),
+		"-Djava.awt.headless=true", "-Djava.io.tmpdir="+temp, "-jar", installer, "--installClient", stage)
 	cmd.Dir = stage
+	cmd.Env = append(os.Environ(), "TEMP="+temp, "TMP="+temp)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windowsNoConsole}
 	reader, writer := io.Pipe()
 	defer reader.Close()

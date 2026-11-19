@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,6 +19,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/windows"
 )
 
 type artifact struct {
@@ -86,10 +89,8 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 	if lock != nil {
 		defer lock.Close()
 		defer func() {
-			if errors.Is(context.Cause(ctx), ErrTaskCanceled) {
-				if err := os.RemoveAll(cache); err != nil {
-					result = errors.Join(result, fmt.Errorf("无法清理下载缓存：%w", err))
-				}
+			if err := os.RemoveAll(cache); err != nil {
+				result = errors.Join(result, fmt.Errorf("无法清理下载缓存：%w", err))
 			}
 		}()
 		if t.ready() {
@@ -140,7 +141,7 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 		return err
 	}
 	defer res.Body.Close()
-	return t.saveTransfer(func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
+	return t.saveTransfer(ctx, func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
 		return copyHTTP(ctx, t.URL, res, file, digest, limit, progress)
 	})
 }
@@ -154,8 +155,14 @@ func (t transfer) sizeLimit() int64 {
 	return 512 << 20
 }
 
-func (t transfer) saveTransfer(write func(*os.File, hash.Hash, int64) (int64, error)) error {
-	file, err := os.CreateTemp(filepath.Dir(t.target), ".part-*")
+func (t transfer) saveTransfer(ctx context.Context, write func(*os.File, hash.Hash, int64) (int64, error)) error {
+	dir := downloadTempDir(ctx)
+	if dir == "" {
+		dir = filepath.Dir(t.target)
+	} else if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(dir, ".part-*")
 	if err != nil {
 		return err
 	}
@@ -177,10 +184,45 @@ func (t transfer) saveTransfer(write func(*os.File, hash.Hash, int64) (int64, er
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(file.Name(), t.target); err != nil && !t.ready() {
+	if err := moveDownload(file.Name(), t.target); err != nil && !t.ready() {
 		return err
 	}
 	return nil
+}
+
+func moveDownload(source, target string) error {
+	if strings.EqualFold(filepath.VolumeName(source), filepath.VolumeName(target)) {
+		return os.Rename(source, target)
+	}
+	from, err := windows.UTF16PtrFromString(source)
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_COPY_ALLOWED|windows.MOVEFILE_REPLACE_EXISTING)
+}
+
+func linkOrCopy(source, target string) error {
+	if strings.EqualFold(filepath.VolumeName(source), filepath.VolumeName(target)) {
+		return os.Link(source, target)
+	}
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(output, input)
+	if err = errors.Join(err, output.Close()); err != nil {
+		_ = os.Remove(target)
+	}
+	return err
 }
 
 func ensureAll(ctx context.Context, work []transfer, label string, status func(string)) error {

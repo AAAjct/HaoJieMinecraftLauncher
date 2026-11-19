@@ -286,7 +286,7 @@ func (e Engine) installResource(ctx context.Context, kind string, instance Insta
 		}
 		folder = filepath.Join("saves", world, "datapacks")
 	}
-	stage, err := os.MkdirTemp(game, ".download-")
+	stage, err := makeCacheStage(ctx, ".download-")
 	if err != nil {
 		return err
 	}
@@ -384,7 +384,7 @@ func publishResources(work []transfer, targetDir string, mod bool) error {
 	var added []string
 	for _, item := range toPublish {
 		target := filepath.Join(targetDir, filepath.Base(item.target))
-		if err := os.Link(item.target, target); err != nil {
+		if err := linkOrCopy(item.target, target); err != nil {
 			for _, path := range added {
 				_ = os.Remove(path)
 			}
@@ -418,10 +418,7 @@ func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, statu
 	if err != nil {
 		return Instance{}, err
 	}
-	if err := os.MkdirAll(e.gameRoot(), 0700); err != nil {
-		return Instance{}, err
-	}
-	stage, err := os.MkdirTemp(e.gameRoot(), ".pack-")
+	stage, err := makeCacheStage(ctx, ".pack-")
 	if err != nil {
 		return Instance{}, err
 	}

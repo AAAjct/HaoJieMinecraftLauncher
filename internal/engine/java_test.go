@@ -2,11 +2,19 @@ package engine
 
 import (
 	"archive/zip"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestLauncherJavaMajors(t *testing.T) {
@@ -59,6 +67,185 @@ func TestExtractJDK(t *testing.T) {
 				t.Fatalf("valid archive failed: %v", err)
 			}
 		})
+	}
+}
+
+func TestConcurrentJavaInstallReusesJDK21(t *testing.T) {
+	e := Engine{DataDir: t.TempDir()}
+	archives := make(map[int][]byte)
+	for _, major := range []int{17, 21} {
+		var data bytes.Buffer
+		z := zip.NewWriter(&data)
+		for path, contents := range map[string]string{
+			"zulu/bin/java.exe":  "test JVM",
+			"zulu/bin/javac.exe": "test compiler",
+			"zulu/release":       fmt.Sprintf("JAVA_VERSION=\"%d.0.1\"\n", major),
+		} {
+			entry, err := z.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.WriteString(entry, contents); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := z.Close(); err != nil {
+			t.Fatal(err)
+		}
+		archives[major] = data.Bytes()
+	}
+	var mu sync.Mutex
+	downloads := make(map[int]int)
+	previous := client.Transport
+	t.Cleanup(func() { client.Transport = previous })
+	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		for major, archive := range archives {
+			id := fmt.Sprintf("00000000-0000-0000-0000-%012d", major)
+			name := fmt.Sprintf("zulu%d-win_x64.zip", major)
+			address := "https://cdn.azul.com/" + name
+			var body []byte
+			switch {
+			case req.URL.Query().Get("java_version") == fmt.Sprint(major):
+				body = fmt.Appendf(nil, `[{"package_uuid":%q,"name":%q,"java_version":[%d,0,1]}]`, id, name, major)
+			case req.URL.String() == azulAPI+id:
+				body = fmt.Appendf(nil, `{"download_url":%q,"sha256_hash":"%x"}`, address, sha256.Sum256(archive))
+			case req.URL.String() == address:
+				mu.Lock()
+				downloads[major]++
+				mu.Unlock()
+				body = archive
+			default:
+				continue
+			}
+			return &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(body)), Body: io.NopCloser(bytes.NewReader(body)), Request: req}, nil
+		}
+		return nil, fmt.Errorf("unexpected fixture URL %s", req.URL)
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	var workers sync.WaitGroup
+	t.Cleanup(func() {
+		cancel()
+		workers.Wait()
+	})
+	type result struct {
+		home string
+		err  error
+	}
+	start := func(major int, status func(string)) <-chan result {
+		done := make(chan result, 1)
+		workers.Go(func() {
+			home, err := e.EnsureJava(ctx, major, status)
+			done <- result{home, err}
+		})
+		return done
+	}
+	extracting, proceed, waiting := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	first := start(21, func(status string) {
+		if strings.HasPrefix(status, "正在解压") {
+			close(extracting)
+			select {
+			case <-proceed:
+			case <-ctx.Done():
+			}
+		}
+	})
+	select {
+	case <-extracting:
+	case result := <-first:
+		t.Fatalf("first JDK 21 task did not reach extraction: %+v", result)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	second := start(17, func(string) {})
+	third := start(21, func(status string) {
+		if strings.HasPrefix(status, "正在等待") {
+			close(waiting)
+		}
+		if strings.HasPrefix(status, "正在解压") {
+			t.Error("the second JDK 21 task extracted a separate copy")
+		}
+	})
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	check := func(done <-chan result, major int) {
+		t.Helper()
+		select {
+		case result := <-done:
+			if result.err != nil || result.home != e.javaHome(major) || !isJDK(result.home, major) {
+				t.Fatalf("JDK %d result: %+v", major, result)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	check(second, 17)
+	close(proceed)
+	check(first, 21)
+	check(third, 21)
+	if entries, err := os.ReadDir(filepath.Join(e.gameRoot(), ".hjm-cache", "temp")); err != nil || len(entries) != 0 {
+		t.Fatalf("JDK staging files remain: %v (%v)", entries, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if downloads[17] != 1 || downloads[21] != 1 {
+		t.Fatalf("download counts = %v, want one per version", downloads)
+	}
+}
+
+func TestWaitingJavaReusesJDKBeforeLockIsReleased(t *testing.T) {
+	e := Engine{JavaRoot: t.TempDir()}
+	lock, err := os.Create(filepath.Join(e.JavaRoot, ".zulu-21.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if claimed, err := waitFileLock(t.Context(), lock, nil); !claimed || err != nil {
+		t.Fatalf("cannot hold first install lock: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	waiting := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		home, err := e.EnsureJava(ctx, 21, func(status string) {
+			if strings.HasPrefix(status, "正在等待") {
+				close(waiting)
+			}
+		})
+		if err == nil && home != e.javaHome(21) {
+			err = fmt.Errorf("unexpected JDK home %s", home)
+		}
+		done <- err
+	}()
+	select {
+	case <-waiting:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	staged := t.TempDir()
+	if err := os.Mkdir(filepath.Join(staged, "bin"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for path, contents := range map[string]string{
+		"bin/java.exe": "test JVM", "bin/javac.exe": "test compiler", "release": "JAVA_VERSION=\"21.0.13.1\"\n",
+	} {
+		if err := os.WriteFile(filepath.Join(staged, path), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Rename(staged, e.javaHome(21)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("published JDK 21 remained blocked behind its install lock")
 	}
 }
 

@@ -19,7 +19,7 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 | 模组、光影、资源包 | 安装到兼容实例的 `mods/`、`shaderpacks/`、`resourcepacks/` |
 | 数据包 | 选择实例和现有世界，安装到该存档的 `datapacks/` |
 
-- 游戏版本和资源可以同时下载安装。打开 **任务** 查看进度或单独取消。取消任务会清理对应的临时下载和续传缓存。网络中断时，支持校验和续传的下载可在重试时接着下载。
+- 游戏版本和资源可以同时下载安装。打开 **任务** 查看进度或单独取消。支持校验和续传的下载在任务内重试时可接着下载。任务结束时会清理对应的临时下载和续传文件。
 - 有可用国内镜像时先请求镜像，再自动回退官方源。Minecraft 使用 BMCLAPI，Modrinth 和 CurseForge 使用 MCIM。需要访问 CurseForge 官方 API 或 CDN 时，可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`。
 - 在 **下载** 页可切换 Modrinth 或 CurseForge。模组和整合包的加载器筛选提供 Fabric、Forge 和 NeoForge。
 - 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge API 未返回下载地址时，会尝试通过 CurseForge 网站下载并校验文件。
@@ -32,8 +32,9 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 
 | 位置 | 内容 |
 | --- | --- |
-| EXE 同级的 `.minecraft/` | 共享运行库、资源缓存、`.hjml-cache/` 中的共享客户端与续传文件，以及 `versions/<实例目录>/` 下的实例数据 |
-| EXE 同级的 `jdk/zulu <主版本>/` | 自动安装的 Zulu JDK 8、17、21、25 |
+| EXE 同级的 `.minecraft/` | 共享运行库、资源、`.hjml-cache/` 中的共享客户端，以及 `versions/<实例目录>/` 下的实例数据 |
+| `.minecraft/.hjm-cache/temp/` | 临时下载、续传分片及安装器工作文件，使用结束后清理 |
+| EXE 同级的 `jdk/zulu <主版本>/` | 已安装的 Zulu JDK |
 | `%LOCALAPPDATA%\HJML` | 启动器设置、版本目录缓存以及旧版实例 |
 | 实例目录的 `hjml-latest.log` | 最近一次游戏启动日志 |
 

@@ -93,6 +93,18 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	if err := normalizeDirectoryCase(ctx, parent); err != nil {
 		return "", err
 	}
+	reuse := func() (string, error) {
+		if err := normalizeDirectoryCase(ctx, target); err != nil {
+			return "", err
+		}
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		return target, nil
+	}
+	if isJDK(target, major) {
+		return reuse()
+	}
 	if err := os.MkdirAll(parent, 0700); err != nil {
 		return "", err
 	}
@@ -100,17 +112,36 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	if err != nil {
 		return "", err
 	}
-	defer lock.Close()
-	if err := waitFileLock(ctx, lock); err != nil {
+	var stage string
+	cleanup := true
+	defer func() {
+		// A caller can use a published JDK while the installer removes its archive.
+		lock.Close()
+		if cleanup && stage != "" {
+			os.RemoveAll(stage)
+		}
+	}()
+	label := fmt.Sprintf("Zulu JDK %d", major)
+	waiting := false
+	locked, err := waitFileLock(ctx, lock, func() bool {
+		if isJDK(target, major) {
+			return true
+		}
+		if !waiting {
+			waiting = true
+			status("正在等待其他任务安装 " + label + "…")
+		}
+		return false
+	})
+	if err != nil {
 		return "", err
 	}
-	if isJDK(target, major) {
-		if err := normalizeDirectoryCase(ctx, target); err != nil {
-			return "", err
+	if !locked || isJDK(target, major) {
+		if waiting {
+			status("正在复用已安装的 " + label + "…")
 		}
-		return target, nil
+		return reuse()
 	}
-	label := fmt.Sprintf("Zulu JDK %d", major)
 	status("正在查询 " + label + "…")
 	query := fmt.Sprintf("java_version=%d&os=windows&arch=x86&hw_bitness=64", major) +
 		"&archive_type=zip&java_package_type=jdk&javafx_bundled=false&crac_supported=false" +
@@ -147,17 +178,10 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 		return "", fmt.Errorf("Azul 返回的 %s 下载地址或校验值无效", label)
 	}
 
-	stage, err := os.MkdirTemp(parent, ".install-")
+	stage, err = makeCacheStage(ctx, ".jdk-")
 	if err != nil {
 		return "", err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			os.RemoveAll(stage)
-		}
-	}()
-
 	archive := filepath.Join(stage, strings.ToLower(packages[0].Name))
 	item := transfer{artifact{URL: build.URL, SHA256: build.Hash}, archive}
 	progress := &downloadProgress{label: label, status: status, start: time.Now()}
@@ -170,6 +194,7 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	if err := extractJDK(ctx, archive, unpacked); err != nil {
 		return "", fmt.Errorf("%s 解压失败：%w", label, err)
 	}
+	status("正在验证并安装 " + label + "…")
 	folders, err := os.ReadDir(unpacked)
 	if err != nil {
 		return "", err
@@ -196,6 +221,7 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 		}
 		return "", err
 	}
+	status("已安装 " + label + "，正在清理临时文件…")
 	return target, nil
 }
 

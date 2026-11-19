@@ -25,11 +25,24 @@ func (e Engine) resumableDownloads(ctx context.Context) context.Context {
 	if ctx.Value(downloadCacheKey{}) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, downloadCacheKey{}, filepath.Join(e.gameRoot(), ".hjml-cache", "downloads"))
+	return context.WithValue(ctx, downloadCacheKey{}, filepath.Join(e.gameRoot(), ".hjm-cache", "temp"))
+}
+
+func downloadTempDir(ctx context.Context) string {
+	dir, _ := ctx.Value(downloadCacheKey{}).(string)
+	return dir
+}
+
+func makeCacheStage(ctx context.Context, pattern string) (string, error) {
+	dir := downloadTempDir(ctx)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(dir, pattern)
 }
 
 func (t transfer) lockResumeCache(ctx context.Context) (string, *os.File, error) {
-	root, _ := ctx.Value(downloadCacheKey{}).(string)
+	root := downloadTempDir(ctx)
 	_, checksum := t.digest()
 	if root == "" || checksum == "" || t.Size > 0 && t.Size < minimumResumableSize {
 		return "", nil, nil
@@ -38,33 +51,45 @@ func (t transfer) lockResumeCache(ctx context.Context) (string, *os.File, error)
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return "", nil, nil
 	}
-	lock, err := os.OpenFile(filepath.Join(root, key[:2]+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	locks := filepath.Join(filepath.Dir(root), "locks")
+	if err := os.MkdirAll(locks, 0700); err != nil {
+		return "", nil, nil
+	}
+	lock, err := os.OpenFile(filepath.Join(locks, key[:2]+".lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return "", nil, nil
 	}
-	if err := waitFileLock(ctx, lock); err != nil {
+	if _, err := waitFileLock(ctx, lock, nil); err != nil {
 		lock.Close()
 		return "", nil, err
 	}
 	return filepath.Join(root, key), lock, nil
 }
 
-func waitFileLock(ctx context.Context, lock *os.File) error {
+// waitFileLock returns false without acquiring the lock if ready becomes true
+// while another caller holds it.
+func waitFileLock(ctx context.Context, lock *os.File, ready func() bool) (bool, error) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
 		var position windows.Overlapped
 		err := windows.LockFileEx(windows.Handle(lock.Fd()),
 			windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &position)
 		if err == nil {
-			return nil
+			return true, nil
 		}
 		if !errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
-			return err
+			return false, err
+		}
+		if ready != nil && ready() {
+			return false, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -97,7 +122,7 @@ func (t transfer) copyResumable(ctx context.Context, dir string, progress func(i
 			size = t.Size
 		}
 		if size < minimumResumableSize {
-			return t.saveTransfer(func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
+			return t.saveTransfer(ctx, func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
 				return copyHTTP(ctx, t.URL, initial, file, digest, limit, progress)
 			})
 		}
@@ -147,7 +172,7 @@ func (t transfer) copyResumable(ctx context.Context, dir string, progress func(i
 			return err
 		}
 	}
-	err := t.saveTransfer(func(file *os.File, digest hash.Hash, _ int64) (int64, error) {
+	err := t.saveTransfer(ctx, func(file *os.File, digest hash.Hash, _ int64) (int64, error) {
 		out := io.MultiWriter(file, digest)
 		var copied int64
 		for part := range plan.Parts {
@@ -171,7 +196,7 @@ func (t transfer) copyResumable(ctx context.Context, dir string, progress func(i
 		}
 		return copied, nil
 	})
-	if err == nil || errors.Is(err, errTransferHash) {
+	if errors.Is(err, errTransferHash) {
 		_ = os.RemoveAll(dir)
 	}
 	return err

@@ -257,7 +257,7 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, archive s
 		stage, err = reservePackDirectory(root, stem)
 		instance.ID = filepath.Base(stage)
 	} else {
-		stage, err = os.MkdirTemp(root, ".install-")
+		stage, err = makeCacheStage(ctx, ".install-")
 	}
 	if err != nil {
 		return Instance{}, err
