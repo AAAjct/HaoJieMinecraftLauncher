@@ -738,6 +738,10 @@ func (a *app) preloadModNames() {
 }
 
 func main() {
+	// The launcher UI can render on the CPU without loading graphics drivers.
+	if _, configured := os.LookupEnv("MYGO_GPU"); !configured {
+		_ = os.Setenv("MYGO_GPU", "0")
+	}
 	data, err := os.UserCacheDir()
 	if err != nil {
 		log.Fatal(err)
