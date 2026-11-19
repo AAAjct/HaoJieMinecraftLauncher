@@ -53,35 +53,11 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		return overlay, fmt.Errorf("Forge 构建版本无效")
 	}
 	addr := repository + build + "/" + artifactName + "-" + build + "-installer.jar"
-	mirror := minecraftMirror(addr)
-	source := func(address string) catalogSource[string] {
-		return func(ctx context.Context) (string, error) {
-			res, err := get(ctx, address+".sha1")
-			if err != nil {
-				return "", err
-			}
-			defer res.Body.Close()
-			sha, err := io.ReadAll(io.LimitReader(res.Body, 512))
-			if err != nil {
-				return "", err
-			}
-			checksum := strings.ToLower(strings.TrimSpace(string(sha)))
-			if !validAssetHash(checksum) {
-				return "", fmt.Errorf("%s 安装器缺少有效的 SHA-1", name)
-			}
-			return checksum, nil
-		}
-	}
-	checksum, err := preferCatalog(ctx, source(mirror), source(addr))
-	if err != nil {
-		return overlay, err
-	}
 	cacheRoot := filepath.Join(e.gameRoot(), i.Loader)
 	installer := filepath.Join(cacheRoot, build+"-installer.jar")
 	status("下载 " + name + " 安装器 · " + i.Build)
-	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, mirror)
-	if err := (transfer{file, installer}).ensure(ctx); err != nil {
-		return overlay, err
+	if err := downloadForgeInstaller(ctx, addr, installer); err != nil {
+		return overlay, fmt.Errorf("下载 %s 安装器：%w", name, err)
 	}
 	z, err := zip.OpenReader(installer)
 	if err != nil {
@@ -164,6 +140,38 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		return nil
 	})
 	return overlay, err
+}
+
+func downloadForgeInstaller(ctx context.Context, addr, target string) error {
+	mirror := minecraftMirror(addr)
+	var sources []catalogSource[string]
+	for _, address := range []string{mirror, neoForgeCDN(addr), addr} {
+		if address == "" {
+			continue
+		}
+		sources = append(sources, func(ctx context.Context) (string, error) {
+			res, err := get(ctx, address+".sha1")
+			if err != nil {
+				return "", err
+			}
+			defer res.Body.Close()
+			sha, err := io.ReadAll(io.LimitReader(res.Body, 512))
+			if err != nil {
+				return "", err
+			}
+			checksum := strings.ToLower(strings.TrimSpace(string(sha)))
+			if !validAssetHash(checksum) {
+				return "", fmt.Errorf("%s 返回的安装器 SHA-1 无效", address)
+			}
+			return checksum, nil
+		})
+	}
+	checksum, err := preferCatalog(ctx, sources...)
+	if err != nil {
+		return err
+	}
+	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, mirror)
+	return (transfer{file, target}).ensure(ctx)
 }
 
 func installerJSON(archive *zip.Reader, name string, out any) error {

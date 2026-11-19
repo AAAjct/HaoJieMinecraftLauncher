@@ -7,6 +7,9 @@ import (
 )
 
 func (a *app) downloadVersions(force bool) {
+	if !a.versionLoading && len(a.versionList) == 0 {
+		a.versionList, a.versionStamp = a.engine.CachedVersions()
+	}
 	if a.catalogContext == nil || a.versionLoading || (!force && time.Since(a.versionStamp) < engine.CatalogMaxAge) {
 		return
 	}
@@ -26,25 +29,11 @@ func (a *app) downloadVersions(force bool) {
 				return
 			}
 			a.versionList, a.versionStamp = versions, time.Now()
-			a.preloadRecentBuilds()
 			if force {
 				a.status = "Minecraft 版本列表已刷新。"
 			}
 		})
 	}()
-}
-
-func (a *app) preloadRecentBuilds() {
-	current := a.current().Version
-	a.preloadBuilds(current)
-	for _, version := range a.versionList {
-		if version.Type == "release" {
-			if version.ID != current {
-				a.preloadBuilds(version.ID)
-			}
-			break
-		}
-	}
 }
 
 func (a *app) preloadBuilds(game string) {

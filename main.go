@@ -163,11 +163,17 @@ func (a *app) runningCount(id string) int {
 
 func (a *app) navigate(page string) {
 	if a.page != page {
+		if a.page == managePage {
+			a.mods, a.modIcons = nil, nil
+		}
 		a.page = page
 		a.mainScroll.Y = 0
 	}
-	if page == managePage {
+	switch page {
+	case managePage:
 		a.refreshInstances()
+	case downloadsPage:
+		a.downloadVersions(false)
 	}
 }
 
@@ -175,7 +181,6 @@ func (a *app) openVersions() {
 	a.navigate(downloadsPage)
 	a.resourceKind = "游戏版本"
 	a.leaveProject()
-	a.downloadVersions(false)
 }
 
 func newApp(core engine.Engine) *app {
@@ -204,7 +209,6 @@ func newApp(core engine.Engine) *app {
 		projectIcons: map[string]ui.ImageSource{}, openResourceGroups: map[loaderKey]bool{},
 		resourceSearches: map[string]*resourceSearch{"mod": {}, "modpack": {}, "shader": {}, "datapack": {}, "resourcepack": {}},
 	}
-	a.versionList, a.versionStamp = core.CachedVersions()
 	a.refreshInstances()
 	return a
 }
@@ -236,8 +240,10 @@ func (a *app) refreshInstances() {
 }
 
 func (a *app) refreshMods() {
-	a.mods = nil
-	a.modIcons = nil
+	a.mods, a.modIcons = nil, nil
+	if a.page != managePage {
+		return
+	}
 	if i := a.current(); i.ID != "" {
 		var err error
 		a.mods, err = a.engine.Mods(i)
@@ -254,7 +260,7 @@ func (a *app) refreshMods() {
 			}
 			a.mods[index].Icon = nil
 		}
-		if a.page == managePage && len(a.mods) > 0 {
+		if len(a.mods) > 0 {
 			a.preloadModNames()
 		}
 	}
@@ -273,7 +279,6 @@ func (a *app) selectInstance(i engine.Instance) {
 	a.modFilter = ""
 	a.refreshMods()
 	a.refreshSkinAvatar()
-	a.preloadBuilds(i.Version)
 }
 
 func (a *app) installed(i engine.Instance) {
@@ -777,8 +782,6 @@ func main() {
 		removeWindowBorder(a.window)
 		a.window.OnClosed(stopCatalog)
 		a.refreshSkinAvatar()
-		a.downloadVersions(false)
-		a.preloadRecentBuilds()
 		a.window.OnFileDrop(func(event *mygo.FileDropEvent) {
 			paths := slices.Clone(event.Paths)
 			a.window.Update(func() { a.receiveFiles(paths) })

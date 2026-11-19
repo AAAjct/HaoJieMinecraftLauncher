@@ -213,9 +213,15 @@ func TestLocalModRowsDisplayMetadata(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(core.DataDir, "instances", instance.ID, "instance.json"),
+		[]byte(`{"ID":"fabric","Name":"测试实例","Loader":"fabric"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
 	a := newApp(core)
-	a.page, a.instances, a.selected = managePage, []engine.Instance{instance}, instance.ID
-	a.refreshMods()
+	if a.current().ID != instance.ID || len(a.mods) != 0 || len(a.modIcons) != 0 {
+		t.Fatalf("startup should select the instance without opening its mods: %+v", a.mods)
+	}
+	a.navigate(managePage)
 	test := ui.NewTester(a.view, 830, 565)
 	icon, hasIcon := test.Find("Demo Mod 图标")
 	title, hasTitle := test.Find("Demo Mod")
@@ -224,6 +230,10 @@ func TestLocalModRowsDisplayMetadata(t *testing.T) {
 	if !hasIcon || !hasTitle || !hasVersion || !hasDetails || a.modIcons["demo-1.2.jar"] == nil ||
 		icon.X+icon.W > title.X || title.X >= version.X || title.X != details.X || details.Y <= title.Y {
 		t.Fatalf("unexpected mod row layout: %v %v %v %v", icon, title, version, details)
+	}
+	a.navigate(launchPage)
+	if len(a.mods) != 0 || len(a.modIcons) != 0 {
+		t.Fatal("leaving instance management should release the mod metadata and icons")
 	}
 }
 

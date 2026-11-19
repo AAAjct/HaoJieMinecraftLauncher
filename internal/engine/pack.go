@@ -285,9 +285,15 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 }
 
 func cursePackTransfer(ctx context.Context, game string, row curseFile) (transfer, error) {
-	file, err := row.version("mod").selectedFile("")
-	if err != nil {
-		return transfer{}, err
+	file := row.resourceFile()
+	if file.URL == "" && row.ModID > 0 && row.ID > 0 && segment(file.Filename) && validAssetHash(file.SHA1) {
+		file.URL = fmt.Sprintf("https://www.curseforge.com/api/v1/mods/%d/files/%d/download", row.ModID, row.ID)
+	} else {
+		var err error
+		file, err = row.version("mod").selectedFile("")
+		if err != nil {
+			return transfer{}, err
+		}
 	}
 	folder := "mods"
 	if !strings.EqualFold(filepath.Ext(file.Filename), ".jar") {

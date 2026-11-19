@@ -14,7 +14,7 @@ try {
     $builtExe = Join-Path $built 'HJML.exe'
     if ($Compress) {
         $upx = Get-Command upx -CommandType Application -ErrorAction Stop
-        & $upx.Source --best --lzma $builtExe
+        & $upx.Source --ultra-brute $builtExe
         if ($LASTEXITCODE -ne 0) { throw 'UPX compression failed.' }
         & $upx.Source -t $builtExe
         if ($LASTEXITCODE -ne 0) { throw 'UPX verification failed.' }

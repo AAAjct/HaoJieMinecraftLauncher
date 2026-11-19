@@ -59,9 +59,6 @@ func (a *app) view(c *ui.Context) {
 				button.Children(func() { ui.Text(c, label).FontSize(15).Bold().TextColor(white) })
 				if button.Clicked() {
 					a.navigate(label)
-					if label == downloadsPage && a.resourceKind == "游戏版本" {
-						a.downloadVersions(false)
-					}
 				}
 			}
 			ui.Spacer(c).Grow(1).Height(48).DragWindow()

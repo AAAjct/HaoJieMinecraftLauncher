@@ -22,7 +22,7 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 - 游戏版本和资源可以同时下载安装。打开 **任务** 查看进度或单独取消。取消任务会清理对应的临时下载和续传缓存。网络中断时，支持校验和续传的下载可在重试时接着下载。
 - 有可用国内镜像时先请求镜像，再自动回退官方源。Minecraft 使用 BMCLAPI，Modrinth 和 CurseForge 使用 MCIM。需要访问 CurseForge 官方 API 或 CDN 时，可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`。
 - 在 **下载** 页可切换 Modrinth 或 CurseForge。模组和整合包的加载器筛选提供 Fabric、Forge 和 NeoForge。
-- 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge 中禁止第三方下载的必需文件会提示失败。
+- 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge API 未返回下载地址时，会尝试通过 CurseForge 网站下载并校验文件。
 - 在 **实例管理 → 从文件安装** 可多选 JAR 模组。系统文件对话框确认后，模组会直接安装到打开对话框时选中的实例。直接拖入 JAR 时会显示目标实例确认。
 - **实例管理** 支持改名、打开目录、刷新模组、启用、禁用及删除。
 - 原版实例默认用 Minecraft 版本命名。带加载器的实例默认包含构建号，例如 `26.3-fabric_0.20.1`。安装、导入或改名时如果名称已被占用，会自动追加首个可用的 `(1)`、`(2)` 等编号。

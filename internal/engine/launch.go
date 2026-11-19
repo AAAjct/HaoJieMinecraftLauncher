@@ -182,7 +182,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		"${version_name}", versionName, "${version_type}", "HJML",
 		"${game_directory}", game, "${assets_root}", assets, "${game_assets}", gameAssets,
 		"${assets_index_name}", profile.AssetIndex.ID, "${natives_directory}", native,
-		"${launcher_name}", "HJML", "${launcher_version}", "1.0.4",
+		"${launcher_name}", "HJML", "${launcher_version}", "1.0.5",
 		"${library_directory}", filepath.Join(e.gameRoot(), "libraries"), "${classpath_separator}", ";",
 		"${classpath}", strings.Join(classpath, ";"),
 	)

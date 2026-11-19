@@ -13,7 +13,22 @@ func (a artifact) orderedSources() []string {
 	if mirror := resourceMirror(a.URL); mirror != "" && (a.SHA1 != "" || a.SHA512 != "") {
 		sources = append(sources, mirror)
 	}
+	if cdn := neoForgeCDN(a.URL); cdn != "" && (a.SHA1 != "" || a.SHA256 != "" || a.SHA512 != "") {
+		sources = append(sources, cdn)
+	}
 	return append(append(sources, a.URL), a.Alternates...)
+}
+
+func neoForgeCDN(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host != "maven.neoforged.net" || u.User != nil {
+		return ""
+	}
+	path := u.EscapedPath()
+	if !strings.HasPrefix(path, "/releases/") {
+		return ""
+	}
+	return "https://neoforged.forgecdn.net" + path
 }
 
 func resourceMirror(raw string) string {

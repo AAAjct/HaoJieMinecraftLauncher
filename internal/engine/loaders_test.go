@@ -1,8 +1,15 @@
 package engine
 
 import (
+	"context"
+	"crypto/sha1"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +47,48 @@ func TestNeoForgeBuildsMatchMinecraftVersion(t *testing.T) {
 		if !slices.Equal(names, test.want) {
 			t.Fatalf("NeoForge %s: got %v, want %v", test.game, names, test.want)
 		}
+	}
+}
+
+func TestNeoForgeInstallerFallsBackToForgeCDN(t *testing.T) {
+	const path = "/net/neoforged/neoforge/21.1.264/neoforge-21.1.264-installer.jar"
+	const jar = "NeoForge installer fixture"
+	previous := client.Transport
+	t.Cleanup(func() { client.Transport = previous })
+	var requests []string
+	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		address := req.URL.Host + req.URL.Path
+		requests = append(requests, address)
+		status, body := http.StatusOK, ""
+		switch address {
+		case "bmclapi2.bangbang93.com/maven" + path + ".sha1":
+			status = http.StatusNotFound
+		case "neoforged.forgecdn.net/releases" + path + ".sha1":
+			body = fmt.Sprintf("%x", sha1.Sum([]byte(jar)))
+		case "bmclapi2.bangbang93.com/maven" + path:
+			body = "incorrect installer contents"
+		case "neoforged.forgecdn.net/releases" + path:
+			body = jar
+		default:
+			return nil, context.DeadlineExceeded
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	target := filepath.Join(t.TempDir(), "installer.jar")
+	if err := downloadForgeInstaller(t.Context(), "https://maven.neoforged.net/releases"+path, target); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != jar {
+		t.Fatalf("installer = %q, err = %v", got, err)
+	}
+	want := []string{
+		"bmclapi2.bangbang93.com/maven" + path + ".sha1",
+		"neoforged.forgecdn.net/releases" + path + ".sha1",
+		"bmclapi2.bangbang93.com/maven" + path,
+		"neoforged.forgecdn.net/releases" + path,
+	}
+	if !slices.Equal(requests, want) {
+		t.Fatalf("requests = %v, want %v", requests, want)
 	}
 }
 
