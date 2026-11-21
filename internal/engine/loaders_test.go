@@ -62,40 +62,57 @@ func TestNeoForgeInstallerFallsBackToForgeCDN(t *testing.T) {
 	const jar = "NeoForge installer fixture"
 	previous := client.Transport
 	t.Cleanup(func() { client.Transport = previous })
-	var requests []string
+	cdnStarted := make(chan struct{})
+	cdnStopped := make(chan struct{})
+	var downloads []string
 	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
 		address := req.URL.Host + req.URL.Path
-		requests = append(requests, address)
 		status, body := http.StatusOK, ""
 		switch address {
-		case "bmclapi2.bangbang93.com/maven" + path + ".sha1":
-			status = http.StatusNotFound
 		case "neoforged.forgecdn.net/releases" + path + ".sha1":
+			close(cdnStarted)
+			<-req.Context().Done()
+			close(cdnStopped)
+			return nil, req.Context().Err()
+		case "maven.neoforged.net/releases" + path + ".sha1":
+			select {
+			case <-cdnStarted:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
 			body = fmt.Sprintf("%x", sha1.Sum([]byte(jar)))
 		case "bmclapi2.bangbang93.com/maven" + path:
+			downloads = append(downloads, address)
 			body = "incorrect installer contents"
 		case "neoforged.forgecdn.net/releases" + path:
+			downloads = append(downloads, address)
 			body = jar
 		default:
-			return nil, context.DeadlineExceeded
+			t.Errorf("unexpected download request %s", address)
+			status = http.StatusNotFound
 		}
 		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 	})
 	target := filepath.Join(t.TempDir(), "installer.jar")
-	if err := downloadForgeInstaller(t.Context(), "https://maven.neoforged.net/releases"+path, target, "下载 NeoForge 安装器", func(string) {}); err != nil {
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := downloadForgeInstaller(ctx, "https://maven.neoforged.net/releases"+path, target, "下载 NeoForge 安装器", func(string) {}); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-cdnStopped:
+	case <-ctx.Done():
+		t.Fatal("the stalled checksum request was not canceled")
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != jar {
 		t.Fatalf("installer = %q, err = %v", got, err)
 	}
 	want := []string{
-		"bmclapi2.bangbang93.com/maven" + path + ".sha1",
-		"neoforged.forgecdn.net/releases" + path + ".sha1",
 		"bmclapi2.bangbang93.com/maven" + path,
 		"neoforged.forgecdn.net/releases" + path,
 	}
-	if !slices.Equal(requests, want) {
-		t.Fatalf("requests = %v, want %v", requests, want)
+	if !slices.Equal(downloads, want) {
+		t.Fatalf("downloads = %v, want %v", downloads, want)
 	}
 }
 

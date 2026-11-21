@@ -271,6 +271,59 @@ func TestDownloadsReportEverySourceAndSkipPermanentFailures(t *testing.T) {
 	}
 }
 
+func TestLargeDownloadFallsBackToSingleConnectionAfterTransientRangeErrors(t *testing.T) {
+	content := make([]byte, minimumSegmentedSize)
+	var ranged, full atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			ranged.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		full.Add(1)
+		http.ServeContent(w, r, "asset", time.Time{}, bytes.NewReader(content))
+	}))
+	defer server.Close()
+	e := Engine{GameRoot: t.TempDir()}
+	item := transfer{artifact{URL: server.URL, Size: int64(len(content)), SHA256: fmt.Sprintf("%x", sha256.Sum256(content))}, filepath.Join(e.GameRoot, "asset")}
+	if err := item.ensure(e.resumableDownloads(t.Context())); err != nil {
+		t.Fatal(err)
+	}
+	if ranged.Load() < 2 || full.Load() < 2 || !item.ready() {
+		t.Fatalf("expected range attempts followed by a complete download, got %d range and %d full requests", ranged.Load(), full.Load())
+	}
+}
+
+func TestAssetBatchFinishesOtherFilesAfterFailure(t *testing.T) {
+	missingStarted := make(chan struct{})
+	validStarted := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/missing" {
+			<-validStarted
+			w.WriteHeader(http.StatusNotFound)
+			close(missingStarted)
+			return
+		}
+		close(validStarted)
+		<-missingStarted
+		select {
+		case <-r.Context().Done():
+		case <-time.After(50 * time.Millisecond):
+			_, _ = w.Write([]byte("asset"))
+		}
+	}))
+	defer server.Close()
+	dir := t.TempDir()
+	work := []transfer{
+		{artifact{URL: server.URL + "/missing"}, filepath.Join(dir, "missing")},
+		{artifact{URL: server.URL + "/valid"}, filepath.Join(dir, "valid")},
+	}
+	err := ensureBatch(t.Context(), work, assetsStage, func(string) {}, false)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") || !work[1].ready() {
+		t.Fatalf("expected failure and a retained asset, got %v, ready=%v", err, work[1].ready())
+	}
+}
+
 func TestMigrateDownloadCachePreservesExistingVersionCache(t *testing.T) {
 	e := Engine{GameRoot: t.TempDir()}
 	old := filepath.Join(e.GameRoot, ".hjm-cache")

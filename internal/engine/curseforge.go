@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,7 +20,12 @@ import (
 
 const cursePrefix = "curseforge:"
 
-func curseForgeKey() string { return strings.TrimSpace(os.Getenv("CURSEFORGE_API_KEY")) }
+func curseForgeKey() string {
+	if key := strings.TrimSpace(os.Getenv("CURSEFORGE_API_KEY")); key != "" {
+		return key
+	}
+	return builtInCurseForgeKey
+}
 
 func curseForgeHost(host string) bool {
 	return host == "api.curseforge.com" || curseForgeCDN(host)
@@ -77,26 +84,27 @@ func curseJSON[T any](ctx context.Context, path string) (curseResponse[T], error
 }
 
 func curseRequest[T any](ctx context.Context, method, path string, body []byte) (curseResponse[T], error) {
-	source := func(base string) catalogSource[curseResponse[T]] {
-		return func(ctx context.Context) (curseResponse[T], error) {
-			var response curseResponse[T]
-			var request io.Reader
-			if body != nil {
-				request = bytes.NewReader(body)
-			}
-			err := catalogRequest(ctx, method, base+path, request, &response)
-			return response, err
-		}
-	}
-	mirror := source(mcim + "/curseforge/v1/")
+	mirror := curseSource[T](method, mcim+"/curseforge/v1/"+path, body)
 	if curseForgeKey() != "" {
-		return preferCatalog(ctx, mirror, source("https://api.curseforge.com/v1/"))
+		return preferCatalog(ctx, mirror, curseSource[T](method, "https://api.curseforge.com/v1/"+path, body))
 	}
 	response, err := preferCatalog(ctx, mirror)
 	if err != nil {
 		return response, fmt.Errorf("CurseForge 镜像请求失败（官方回退需要 CURSEFORGE_API_KEY）：%w", err)
 	}
 	return response, nil
+}
+
+func curseSource[T any](method, address string, body []byte) catalogSource[curseResponse[T]] {
+	return func(ctx context.Context) (curseResponse[T], error) {
+		var response curseResponse[T]
+		var request io.Reader
+		if body != nil {
+			request = bytes.NewReader(body)
+		}
+		err := catalogRequest(ctx, method, address, request, &response)
+		return response, err
+	}
 }
 
 type curseProject struct {
@@ -186,11 +194,13 @@ type curseFile struct {
 	FileLength             int64
 	IsServerPack           bool
 	GameVersions           []string
+	Modules                []struct{ Name string }
 	Hashes                 []struct {
 		Value string
 		Algo  int
 	}
 	Dependencies []struct{ ModID, RelationType int }
+	publicFolder string
 }
 
 func (f curseFile) resourceFile() resourceFile {
@@ -277,22 +287,185 @@ func curseGetFiles(ctx context.Context, ids []int) ([]curseFile, error) {
 	if err != nil {
 		return nil, err
 	}
-	response, err := curseRequest[[]curseFile](ctx, http.MethodPost, "mods/files", payload)
-	return response.Data, err
+	if curseForgeKey() == "" {
+		response, err := curseRequest[[]curseFile](ctx, http.MethodPost, "mods/files", payload)
+		return response.Data, err
+	}
+	response, mirrorErr := preferCatalog(ctx, curseSource[[]curseFile](http.MethodPost, mcim+"/curseforge/v1/mods/files", payload))
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	found := make(map[int]bool, len(response.Data))
+	for _, row := range response.Data {
+		found[row.ID] = row.matches(row.ModID, row.ID)
+	}
+	missing := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if !found[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 {
+		return response.Data, nil
+	}
+	payload, err = json.Marshal(map[string][]int{"fileIds": missing})
+	if err != nil {
+		return nil, err
+	}
+	officialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	official, officialErr := curseSource[[]curseFile](http.MethodPost, "https://api.curseforge.com/v1/mods/files", payload)(officialCtx)
+	if officialErr != nil && len(response.Data) == 0 {
+		return nil, errors.Join(mirrorErr, officialErr)
+	}
+	return append(response.Data, official.Data...), nil
 }
 
-func curseGetFile(ctx context.Context, project, file int) (curseFile, error) {
+func curseGetFile(ctx context.Context, project, file int, gameVersion string) (curseFile, error) {
 	if project <= 0 || file <= 0 {
 		return curseFile{}, fmt.Errorf("整合包包含无效的 CurseForge 文件 ID")
 	}
-	res, err := curseJSON[curseFile](ctx, fmt.Sprintf("mods/%d/files/%d", project, file))
-	if err != nil {
+	projectFiles := fmt.Sprintf("mods/%d/files", project)
+	readExact := func() (curseFile, error) {
+		res, err := curseJSON[curseFile](ctx, fmt.Sprintf("%s/%d", projectFiles, file))
+		if err != nil {
+			return curseFile{}, err
+		}
+		return findCurseFile([]curseFile{res.Data}, project, file)
+	}
+	row, firstErr := readExact()
+	if firstErr == nil {
+		return row, nil
+	}
+	if ctx.Err() != nil {
+		return curseFile{}, ctx.Err()
+	}
+	var publicErr error
+	if curseTransient(firstErr) {
+		if row, publicErr = cursePublicFile(ctx, project, file); publicErr == nil {
+			return row, nil
+		}
+	}
+	rows, batchErr := curseGetFiles(ctx, []int{file})
+	if batchErr == nil {
+		if row, batchErr = findCurseFile(rows, project, file); batchErr == nil {
+			return row, nil
+		}
+	}
+	if ctx.Err() != nil {
+		return curseFile{}, ctx.Err()
+	}
+	query := url.Values{"pageSize": {"50"}, "gameVersion": {gameVersion}}
+	res, listErr := curseJSON[[]curseFile](ctx, projectFiles+"?"+query.Encode())
+	if listErr == nil {
+		if row, listErr = findCurseFile(res.Data, project, file); listErr == nil {
+			return row, nil
+		}
+	}
+	var retryErr error
+	if curseTransient(firstErr) {
+		timer := time.NewTimer(350 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return curseFile{}, ctx.Err()
+		case <-timer.C:
+		}
+		if row, retryErr = readExact(); retryErr == nil {
+			return row, nil
+		}
+	}
+	if ctx.Err() != nil {
+		return curseFile{}, ctx.Err()
+	}
+	if publicErr == nil {
+		if row, publicErr = cursePublicFile(ctx, project, file); publicErr == nil {
+			return row, nil
+		}
+	}
+	return curseFile{}, fmt.Errorf("无法取得 CurseForge 文件信息：%w", errors.Join(firstErr, batchErr, listErr, retryErr, publicErr))
+}
+
+var curseWidgetSlots = make(chan struct{}, 2)
+
+func cursePublicFile(ctx context.Context, project, file int) (curseFile, error) {
+	select {
+	case curseWidgetSlots <- struct{}{}:
+		defer func() { <-curseWidgetSlots }()
+	case <-ctx.Done():
+		return curseFile{}, ctx.Err()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	var data struct {
+		ID         int
+		Game, Type string
+		Files      []struct {
+			ID       int
+			Name     string
+			FileSize int64
+		}
+	}
+	if err := catalogJSON(ctx, "https://api.cfwidget.com/"+strconv.Itoa(project), &data); err != nil {
 		return curseFile{}, err
 	}
-	if res.Data.ID != file || res.Data.ModID != project {
-		return curseFile{}, fmt.Errorf("CurseForge 文件 %d/%d 的元数据不匹配", project, file)
+	var folder, extension string
+	switch strings.ToLower(data.Type) {
+	case "mods":
+		folder, extension = "mods", ".jar"
+	case "texture packs", "resource packs":
+		folder, extension = "resourcepacks", ".zip"
+	case "shaders":
+		folder, extension = "shaderpacks", ".zip"
 	}
-	return res.Data, nil
+	if data.ID == project && data.Game == "minecraft" && folder != "" {
+		for _, entry := range data.Files {
+			if entry.ID == file && entry.FileSize > 0 && entry.FileSize <= packEntryLimit &&
+				segment(entry.Name) && strings.EqualFold(filepath.Ext(entry.Name), extension) {
+				return curseFile{ID: file, ModID: project, FileName: entry.Name, FileLength: entry.FileSize,
+					DownloadURL: curseCDNFileURL(file, entry.Name), publicFolder: folder}, nil
+			}
+		}
+	}
+	return curseFile{}, fmt.Errorf("CFWidget 缺少 CurseForge 文件 %d/%d 的公开记录", project, file)
+}
+
+func curseTransient(err error) bool {
+	var failure httpFailure
+	if errors.As(err, &failure) {
+		return failure.status == http.StatusTooManyRequests || failure.status >= 500
+	}
+	var networkError net.Error
+	return errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError)
+}
+
+func (f curseFile) matches(project, file int) bool {
+	return f.ID == file && f.ModID == project && segment(f.FileName) && f.FileLength >= 0 &&
+		validAssetHash(f.resourceFile().SHA1)
+}
+
+func findCurseFile(rows []curseFile, project, file int) (curseFile, error) {
+	for _, row := range rows {
+		if row.matches(project, file) {
+			return row, nil
+		}
+	}
+	return curseFile{}, fmt.Errorf("响应缺少文件 %d/%d 的文件名或 SHA-1", project, file)
+}
+
+func (e Engine) curseFileCachePath(project, file int) string {
+	return filepath.Join(e.cacheDir(), "curseforge", fmt.Sprintf("%d-%d.json", project, file))
+}
+
+func (e Engine) cacheCurseFile(row curseFile) {
+	// Signed URLs can expire independently of the file's immutable SHA-1.
+	if address, err := url.Parse(row.DownloadURL); err == nil && address.RawQuery != "" {
+		return
+	}
+	target := e.curseFileCachePath(row.ModID, row.ID)
+	if os.MkdirAll(filepath.Dir(target), 0700) == nil {
+		_ = writeJSON(target, row)
+	}
 }
 
 func curseDownloadError(err error) error {

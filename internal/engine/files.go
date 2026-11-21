@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"archive/zip"
 	"cmp"
 	"context"
 	"crypto/sha1"
@@ -35,6 +36,7 @@ type artifact struct {
 	Mirrors, Alternates []string `json:"-"`
 	localSource         string
 	rangeParts          int
+	publicArchiveFolder string
 }
 
 type transfer struct {
@@ -129,11 +131,10 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			t.URL = source
 			if cache != "" {
 				workers := t.rangeParts
-				if workers > 4 && attempt > 0 {
+				if attempt == 2 {
+					workers = 1
+				} else if workers > 4 && attempt == 1 {
 					workers = 4
-					if attempt == 2 {
-						workers = 1
-					}
 				}
 				err = t.copyResumable(ctx, cache, workers, progress)
 			} else {
@@ -182,7 +183,13 @@ func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int
 		return err
 	}
 	defer res.Body.Close()
+	if t.publicArchiveFolder != "" && res.Request.URL.String() != t.URL {
+		return fmt.Errorf("CurseForge CDN 返回了非预期的下载地址")
+	}
 	return t.saveTransfer(ctx, func(file *os.File, digest hash.Hash, limit int64) (int64, error) {
+		if t.publicArchiveFolder != "" {
+			return copyHTTPBody(res, file, digest, limit, progress)
+		}
 		return copyHTTP(ctx, t.URL, res, file, digest, limit, progress)
 	})
 }
@@ -222,6 +229,11 @@ func (t transfer) saveTransfer(ctx context.Context, write func(*os.File, hash.Ha
 	if digest != nil && !strings.EqualFold(hex.EncodeToString(digest.Sum(nil)), expected) {
 		return errTransferHash
 	}
+	if t.publicArchiveFolder != "" {
+		if err := validateCurseArchive(file, n, t.publicArchiveFolder); err != nil {
+			return err
+		}
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
@@ -229,6 +241,21 @@ func (t transfer) saveTransfer(ctx context.Context, write func(*os.File, hash.Ha
 		return err
 	}
 	return nil
+}
+
+func validateCurseArchive(file *os.File, size int64, folder string) error {
+	archive, err := zip.NewReader(file, size)
+	if err != nil {
+		return fmt.Errorf("CurseForge CDN 返回的文件不是有效的 ZIP 或 JAR：%w", err)
+	}
+	for _, entry := range archive.File {
+		if folder == "mods" && entry.Name == "META-INF/MANIFEST.MF" ||
+			folder == "resourcepacks" && entry.Name == "pack.mcmeta" ||
+			folder == "shaderpacks" && strings.HasPrefix(entry.Name, "shaders/") && entry.Mode().IsRegular() {
+			return nil
+		}
+	}
+	return fmt.Errorf("CurseForge CDN 返回的压缩包与资源类型不匹配")
 }
 
 func moveDownload(source, target string) error {
@@ -267,6 +294,10 @@ func linkOrCopy(source, target string) error {
 }
 
 func ensureAll(ctx context.Context, work []transfer, label string, status func(string)) error {
+	return ensureBatch(ctx, work, label, status, true)
+}
+
+func ensureBatch(ctx context.Context, work []transfer, label string, status func(string), stopOnError bool) error {
 	total := len(work)
 	var pending []transfer
 	var done int
@@ -355,7 +386,9 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 					downloaded += size - credited
 				} else if first == nil {
 					first = err
-					cancel()
+					if stopOnError {
+						cancel()
+					}
 				}
 				if time.Since(last) >= 250*time.Millisecond || done == total {
 					emit()

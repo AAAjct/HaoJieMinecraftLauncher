@@ -94,14 +94,17 @@ func copyHTTP(ctx context.Context, source string, response *http.Response, file 
 			return 0, err
 		}
 		defer response.Body.Close()
-		size = response.ContentLength
 	}
+	return copyHTTPBody(response, file, digest, limit, progress)
+}
+
+func copyHTTPBody(response *http.Response, file *os.File, digest hash.Hash, limit int64, progress func(int64, int64)) (int64, error) {
 	var out io.Writer = file
 	if digest != nil {
 		out = io.MultiWriter(file, digest)
 	}
 	if progress != nil {
-		out = progressWriter{out, size, progress}
+		out = progressWriter{out, response.ContentLength, progress}
 	}
 	return io.Copy(out, io.LimitReader(response.Body, limit+1))
 }

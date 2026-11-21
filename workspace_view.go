@@ -114,12 +114,10 @@ func (a *app) taskView(c *ui.Context) {
 			ui.Column(c).Gap(7).Children(func() {
 				for _, stage := range task.stages {
 					marker := "•••"
-					if stage.Fraction >= 0 {
-						percent := int(stage.Fraction * 100)
-						if stage.Remaining > 0 {
-							percent = min(percent, 99)
-						}
-						marker = fmt.Sprintf("%d%%", percent)
+					if stage.Fraction >= 1 && stage.Remaining == 0 {
+						marker = "已完成"
+					} else if stage.Fraction >= 0 {
+						marker = fmt.Sprintf("%d%%", min(99, int(stage.Fraction*100)))
 					}
 					ui.Row(c).Key(stage.Label).Gap(12).AlignItems(ui.Center).Children(func() {
 						ui.Column(c).Width(48).Shrink(0).AlignItems(ui.Center).Children(func() {

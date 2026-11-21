@@ -20,7 +20,7 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 | 数据包 | 选择实例和现有世界，安装到该存档的 `datapacks/` |
 
 - Minecraft 客户端、加载器下载和 Zulu JDK 会并行准备。游戏版本和资源也可以同时下载安装。打开 **任务** 查看总进度、下载速度、剩余文件和各阶段进度，也可单独取消任务。支持校验和续传的下载在任务内重试时可接着下载。任务结束时会清理对应的临时下载和续传文件。
-- Minecraft 和 Modrinth 优先使用 BMCLAPI 和 MCIM 镜像。CurseForge 公共文件优先使用 mediafilez CDN，失败时尝试 MCIM 和 edge CDN。需要访问 CurseForge 官方 API 或 CDN 时，可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`。
+- Minecraft 和 Modrinth 优先使用 BMCLAPI 和 MCIM 镜像。CurseForge 公共文件优先使用 mediafilez CDN，失败时尝试 MCIM 和 edge CDN。安装整合包时，如果 MCIM 超时且无法获得官方文件信息，启动器可通过 CFWidget 查找公开文件，并从 CurseForge CDN 下载，核对文件大小和压缩包结构。可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`，启用官方 API 回退。没有配置代理环境变量时，启动器使用 Windows 中已启用的手动代理。
 - 在 **下载** 页可切换 Modrinth 或 CurseForge。模组和整合包的加载器筛选提供 Fabric、Forge 和 NeoForge。
 - 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge 未提供下载地址时，启动器会根据文件 ID 和文件名尝试 CDN，并校验文件。
 - 在 **实例管理 → 从文件安装** 可多选 JAR 模组。系统文件对话框确认后，模组会直接安装到打开对话框时选中的实例。直接拖入 JAR 时会显示目标实例确认。
@@ -50,3 +50,5 @@ go test ./...
 ```
 
 输出文件为 `dist/windows-amd64/HJML.exe`。安装 UPX 后可运行 `.\build.ps1 -Compress -DistributionDirectory dist/compact`，生成更小的单 EXE。GitHub Releases 提供压缩后的 Windows x64 单文件。要运行涉及真实下载及游戏启动的联网集成测试，可设置 `HJML_INTEGRATION=1` 后运行 `go test -v -timeout 15m ./...`。
+
+需要内置 CurseForge API Key 时，调用 `build.ps1 -CurseForgeKeyFromStdin`，由调用进程通过标准输入传递密钥。密钥会编入 EXE，随该构建分发。普通构建不携带密钥。

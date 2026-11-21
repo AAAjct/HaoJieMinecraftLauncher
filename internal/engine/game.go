@@ -480,12 +480,18 @@ func (e Engine) installGame(ctx context.Context, instance Instance, status func(
 	return profile, runParallel(ctx, status, func(ctx context.Context, status func(string)) error {
 		return ensureAll(ctx, packages, librariesStage, status)
 	}, func(ctx context.Context, status func(string)) error {
-		assets, err := e.assetTransfers(ctx, profile, status)
-		if err != nil {
-			return err
-		}
-		return ensureAll(ctx, assets, assetsStage, status)
+		return e.downloadAssets(ctx, profile, status)
 	})
+}
+
+func (e Engine) downloadAssets(ctx context.Context, profile gameProfile, status func(string)) error {
+	assets, err := e.assetTransfers(ctx, profile, status)
+	if err != nil {
+		return err
+	}
+	// Assets are shared across installations, so finish the other downloads
+	// even if a file has exhausted its sources. A retry then only needs the gaps.
+	return ensureBatch(ctx, assets, assetsStage, status, false)
 }
 
 func (e Engine) assetTransfers(ctx context.Context, profile gameProfile, status func(string)) ([]transfer, error) {

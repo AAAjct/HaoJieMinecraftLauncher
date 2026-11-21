@@ -157,11 +157,11 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if err != nil {
 		return nil, err
 	}
-	assetFiles, err := e.assetTransfers(ctx, profile, status)
-	if err != nil {
-		return nil, err
-	}
-	if err := ensureAll(ctx, append(files, assetFiles...), "检查客户端文件和资源", status); err != nil {
+	if err := runParallel(ctx, status, func(ctx context.Context, status func(string)) error {
+		return ensureAll(ctx, files, librariesStage, status)
+	}, func(ctx context.Context, status func(string)) error {
+		return e.downloadAssets(ctx, profile, status)
+	}); err != nil {
 		return nil, err
 	}
 	game := instanceDir
@@ -217,7 +217,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		"${version_name}", versionName, "${version_type}", "HJML",
 		"${game_directory}", game, "${assets_root}", assets, "${game_assets}", gameAssets,
 		"${assets_index_name}", profile.AssetIndex.ID, "${natives_directory}", native,
-		"${launcher_name}", "HJML", "${launcher_version}", "1.0.7",
+		"${launcher_name}", "HJML", "${launcher_version}", "1.0.8",
 		"${library_directory}", filepath.Join(e.gameRoot(), "libraries"), "${classpath_separator}", ";",
 		"${classpath}", strings.Join(classpath, ";"),
 	)

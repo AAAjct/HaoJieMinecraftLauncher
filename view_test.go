@@ -422,6 +422,16 @@ func TestParallelDownloadJobsKeepSeparateTargets(t *testing.T) {
 			t.Errorf("task workspace missing %q", label)
 		}
 	}
+	a.jobs[0].stages[0].Fraction = 1
+	test.Frame()
+	if !test.HasText("99%") || test.HasText("已完成") {
+		t.Fatal("a stage with remaining files must not be marked complete")
+	}
+	a.jobs[0].stages[0].Remaining = 0
+	test.Frame()
+	if !test.HasText("已完成") || test.HasText("100%") {
+		t.Fatal("completed stages must display 已完成")
+	}
 	if err := test.Click("取消 模组一"); err != nil {
 		t.Fatal(err)
 	}

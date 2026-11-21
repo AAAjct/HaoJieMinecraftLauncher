@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -153,12 +154,8 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 
 func downloadForgeInstaller(ctx context.Context, addr, target, label string, status func(string)) error {
 	mirror := minecraftMirror(addr)
-	var sources []catalogSource[string]
-	for _, address := range []string{mirror, neoForgeCDN(addr), addr} {
-		if address == "" {
-			continue
-		}
-		sources = append(sources, func(ctx context.Context) (string, error) {
+	source := func(address string) catalogSource[string] {
+		return func(ctx context.Context) (string, error) {
 			res, err := get(ctx, address+".sha1")
 			if err != nil {
 				return "", err
@@ -173,11 +170,30 @@ func downloadForgeInstaller(ctx context.Context, addr, target, label string, sta
 				return "", fmt.Errorf("%s 返回的安装器 SHA-1 无效", address)
 			}
 			return checksum, nil
-		})
+		}
 	}
-	checksum, err := preferCatalog(ctx, sources...)
+	var checksum string
+	var err error
+	if cdn := neoForgeCDN(addr); cdn != "" {
+		// The CDN and Maven can respond independently. BMCL may host the JAR
+		// without hosting its checksum, so try that metadata only as a fallback.
+		checksum, err = firstCatalog(ctx, source(addr), source(cdn))
+		if err != nil && mirror != "" && ctx.Err() == nil {
+			var mirrorErr error
+			checksum, mirrorErr = preferCatalog(ctx, source(mirror))
+			if mirrorErr != nil {
+				err = errors.Join(err, mirrorErr)
+			} else {
+				err = nil
+			}
+		}
+	} else if mirror != "" {
+		checksum, err = preferCatalog(ctx, source(mirror), source(addr))
+	} else {
+		checksum, err = preferCatalog(ctx, source(addr))
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("获取安装器 SHA-1 失败：%w", err)
 	}
 	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, mirror)
 	return ensureAll(ctx, []transfer{{file, target}}, label, status)

@@ -25,6 +25,7 @@ var client = &http.Client{
 	},
 	Transport: func() *http.Transport {
 		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.Proxy = launcherProxy
 		transport.MaxIdleConns = 128
 		transport.MaxIdleConnsPerHost = 40
 		transport.MaxConnsPerHost = 48

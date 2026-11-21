@@ -249,13 +249,21 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 		const batchSize = 50
 		batches := slices.Collect(slices.Chunk(required, batchSize))
 		rows := make([]curseFile, len(required))
+		for i, entry := range required {
+			var cached curseFile
+			if readJSON(e.curseFileCachePath(entry.ProjectID, entry.FileID), &cached) == nil && cached.matches(entry.ProjectID, entry.FileID) {
+				rows[i] = cached
+			}
+		}
 		batchErrors := make([]error, len(batches))
 		work := make([]transfer, len(required))
 		err := fetchPackEntries(ctx, len(batches), func(ctx context.Context, i int) error {
 			batch := batches[i]
 			ids := make([]int, 0, len(batch))
-			for _, entry := range batch {
-				ids = append(ids, entry.FileID)
+			for n, entry := range batch {
+				if rows[i*batchSize+n].ID == 0 {
+					ids = append(ids, entry.FileID)
+				}
 			}
 			files, err := curseGetFiles(ctx, ids)
 			if err != nil {
@@ -267,7 +275,10 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 				byID[file.ID] = file
 			}
 			for n, entry := range batch {
-				rows[i*batchSize+n] = byID[entry.FileID]
+				index := i*batchSize + n
+				if row := byID[entry.FileID]; rows[index].ID == 0 && row.matches(entry.ProjectID, entry.FileID) {
+					rows[index] = row
+				}
 			}
 			return nil
 		})
@@ -279,12 +290,15 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 		}
 		if err := fetchPackEntries(ctx, len(required), func(ctx context.Context, i int) error {
 			entry, row := required[i], rows[i]
-			if row.ModID != entry.ProjectID {
+			if !row.matches(entry.ProjectID, entry.FileID) {
 				var err error
-				row, err = curseGetFile(ctx, entry.ProjectID, entry.FileID)
+				row, err = curseGetFile(ctx, entry.ProjectID, entry.FileID, instance.Version)
 				if err != nil {
 					return fmt.Errorf("CurseForge 文件 %d/%d：%w", entry.ProjectID, entry.FileID, errors.Join(err, batchErrors[i/batchSize]))
 				}
+			}
+			if row.publicFolder == "" {
+				e.cacheCurseFile(row)
 			}
 			var err error
 			work[i], err = cursePackTransfer(ctx, game, filepath.Dir(archive), row)
@@ -311,22 +325,45 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 
 func cursePackTransfer(ctx context.Context, game, localDir string, row curseFile) (transfer, error) {
 	file := row.resourceFile()
+	if row.publicFolder != "" {
+		item := file.transfer(filepath.Join(game, row.publicFolder))
+		item.publicArchiveFolder = row.publicFolder
+		return item, nil
+	}
 	if !segment(file.Filename) || !validAssetHash(file.SHA1) {
 		return transfer{}, fmt.Errorf("CurseForge 文件 %d/%d 缺少有效文件名或 SHA-1", row.ModID, row.ID)
 	}
 	folder := "mods"
 	if !strings.EqualFold(filepath.Ext(file.Filename), ".jar") {
-		project, err := curseJSON[curseProject](ctx, fmt.Sprintf("mods/%d", row.ModID))
-		if err != nil {
-			return transfer{}, err
+		var assets, metadata, shaders bool
+		for _, module := range row.Modules {
+			switch strings.ToLower(strings.TrimRight(module.Name, "/\\")) {
+			case "assets":
+				assets = true
+			case "pack.mcmeta":
+				metadata = true
+			case "shaders":
+				shaders = true
+			}
 		}
-		switch project.Data.ClassID {
-		case 12:
+		switch {
+		case assets && metadata:
 			folder = "resourcepacks"
-		case 6552:
+		case shaders:
 			folder = "shaderpacks"
 		default:
-			return transfer{}, fmt.Errorf("不支持自动安装整合包文件 %s", file.Filename)
+			project, err := curseJSON[curseProject](ctx, fmt.Sprintf("mods/%d", row.ModID))
+			if err != nil {
+				return transfer{}, fmt.Errorf("无法判断 %s 的安装目录：%w", file.Filename, err)
+			}
+			switch project.Data.ClassID {
+			case 12:
+				folder = "resourcepacks"
+			case 6552:
+				folder = "shaderpacks"
+			default:
+				return transfer{}, fmt.Errorf("不支持自动安装整合包文件 %s", file.Filename)
+			}
 		}
 	}
 	item := file.transfer(filepath.Join(game, folder))

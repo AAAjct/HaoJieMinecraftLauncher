@@ -226,7 +226,12 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	t.Setenv("CURSEFORGE_API_KEY", "test-key")
 	previous := client.Transport
 	t.Cleanup(func() { client.Transport = previous })
+	metadataOffline := false
 	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		if metadataOffline && strings.Contains(req.URL.Path, "/mods/") && !strings.HasSuffix(req.URL.Path, "/download-url") {
+			t.Errorf("cached reimport queried unavailable metadata: %s", req.URL)
+			return nil, context.DeadlineExceeded
+		}
 		code, body := http.StatusOK, ""
 		switch req.URL.Host + req.URL.Path {
 		case "mod.mcimirror.top/curseforge/v1/mods/files":
@@ -237,16 +242,24 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 		case "api.curseforge.com/v1/mods/files":
 			request, err := io.ReadAll(req.Body)
 			req.Body.Close()
-			if err != nil || string(request) != `{"fileIds":[1234,1235,1236]}` || req.Header.Get("X-Api-Key") != "test-key" {
+			if err != nil || (string(request) != `{"fileIds":[1234,1235,6976125]}` && string(request) != `{"fileIds":[1234]}`) || req.Header.Get("X-Api-Key") != "test-key" {
 				return nil, fmt.Errorf("invalid official metadata request")
 			}
 			return nil, context.DeadlineExceeded
-		case "mod.mcimirror.top/curseforge/v1/mods/42/files/1234":
-			body = fmt.Sprintf(`{"data":{"id":1234,"modId":42,"fileName":"mod.jar","downloadUrl":%q,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, cdn, len(mod), sha1.Sum([]byte(mod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/42/files/1234", "api.curseforge.com/v1/mods/42/files/1234":
+			return nil, context.DeadlineExceeded
+		case "mod.mcimirror.top/curseforge/v1/mods/42/files":
+			if req.URL.Query().Get("gameVersion") != "test-version" {
+				t.Errorf("file listing was not filtered by game version: %s", req.URL)
+			}
+			body = fmt.Sprintf(`{"data":[{"id":1234,"modId":42,"fileName":"mod.jar","downloadUrl":%q,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}]}`, cdn, len(mod), sha1.Sum([]byte(mod)))
 		case "mod.mcimirror.top/curseforge/v1/mods/43/files/1235":
 			body = fmt.Sprintf(`{"data":{"id":1235,"modId":43,"fileName":"web.jar","fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, len(webMod), sha1.Sum([]byte(webMod)))
-		case "mod.mcimirror.top/curseforge/v1/mods/44/files/1236":
-			body = fmt.Sprintf(`{"data":{"id":1236,"modId":44,"fileName":"local.jar","fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, len(localMod), sha1.Sum([]byte(localMod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/1342344/files/6976125":
+			body = fmt.Sprintf(`{"data":{"id":6976125,"modId":1342344,"fileName":"Excalibur_Lootr_v1.1.zip","fileLength":%d,"hashes":[{"algo":1,"value":"%x"}],"modules":[{"name":"assets"},{"name":"pack.mcmeta"}]}}`, len(localMod), sha1.Sum([]byte(localMod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/1342344":
+			t.Error("resource packs with file modules should not require a project query")
+			return nil, context.DeadlineExceeded
 		case "mod.mcimirror.top/curseforge/v1/mods/43/files/1235/download-url":
 			if req.Header.Get("X-Api-Key") != "" {
 				return nil, fmt.Errorf("official key sent to mirror")
@@ -259,10 +272,10 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 			body = mod
 		case "api.curseforge.com/v1/mods/43/files/1235/download-url":
 			body = fmt.Sprintf(`{"data":%q}`, webCDN)
-		case "mod.mcimirror.top/curseforge/v1/mods/44/files/1236/download-url",
-			"api.curseforge.com/v1/mods/44/files/1236/download-url":
+		case "mod.mcimirror.top/curseforge/v1/mods/1342344/files/6976125/download-url",
+			"api.curseforge.com/v1/mods/1342344/files/6976125/download-url":
 			body = `{"data":""}`
-		case "mediafilez.forgecdn.net/files/1/236/local.jar":
+		case "mediafilez.forgecdn.net/files/6976/125/Excalibur_Lootr_v1.1.zip":
 			body = localMod
 		case "mod.mcimirror.top/files/12/35/web.jar":
 			code = http.StatusNotFound
@@ -282,7 +295,7 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(entry, `{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Curse ZIP","minecraft":{"version":"test-version"},"files":[{"projectID":42,"fileID":1234,"required":true},{"projectID":43,"fileID":1235,"required":true},{"projectID":44,"fileID":1236,"required":true}]}`); err != nil {
+	if _, err := io.WriteString(entry, `{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Curse ZIP","minecraft":{"version":"test-version"},"files":[{"projectID":42,"fileID":1234,"required":true},{"projectID":43,"fileID":1235,"required":true},{"projectID":1342344,"fileID":6976125,"required":true}]}`); err != nil {
 		t.Fatal(err)
 	}
 	legacyEntry, err := z.Create("overrides/tacz/[\xc0\xb6\xb9\xde\xc7\xfa\xc6\xe6] Blue-tin cookie v1.3.zip")
@@ -319,11 +332,20 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	if err != nil || string(result) != webMod {
 		t.Fatalf("ZIP import through download-url: %q, %v", result, err)
 	}
-	if result, err := os.ReadFile(filepath.Join(expectedDir, "mods", "local.jar")); err != nil || string(result) != localMod {
+	if result, err := os.ReadFile(filepath.Join(expectedDir, "resourcepacks", "Excalibur_Lootr_v1.1.zip")); err != nil || string(result) != localMod {
 		t.Fatalf("ZIP import through CDN fallback: %q, %v", result, err)
 	}
 	if result, err := os.ReadFile(filepath.Join(expectedDir, "tacz", "[蓝罐曲奇] Blue-tin cookie v1.3.zip")); err != nil || string(result) != "nested ZIP fixture" {
 		t.Fatalf("ZIP import with GBK filename: %q, %v", result, err)
+	}
+	var cached curseFile
+	if err := readJSON(e.curseFileCachePath(42, 1234), &cached); err != nil || !cached.matches(42, 1234) {
+		t.Fatalf("resolved file metadata was not cached: %+v, %v", cached, err)
+	}
+	metadataOffline = true
+	again, err := e.ImportPack(t.Context(), zipPath, func(string) {})
+	if err != nil || !regularFile(filepath.Join(e.GameDir(again), "mods", "mod.jar")) {
+		t.Fatalf("cached reimport failed: %+v, %v", again, err)
 	}
 }
 
