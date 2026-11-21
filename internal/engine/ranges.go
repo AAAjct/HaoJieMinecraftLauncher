@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -9,9 +10,59 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 const minimumSegmentedSize = 16 << 20
+const downloadIdleTimeout = 15 * time.Second
+
+var errDownloadIdle = errors.New("下载源长时间未响应")
+
+func getTransfer(ctx context.Context, source, byteRange string) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	idle := time.AfterFunc(downloadIdleTimeout, func() { cancel(errDownloadIdle) })
+	response, err := getHTTP(ctx, source, byteRange)
+	if err != nil {
+		idle.Stop()
+		cancel(nil)
+		if context.Cause(ctx) == errDownloadIdle {
+			return nil, errDownloadIdle
+		}
+		return nil, err
+	}
+	response.Body = &transferBody{
+		ReadCloser: response.Body,
+		ctx:        ctx,
+		cancel:     cancel,
+		idle:       idle,
+	}
+	idle.Reset(downloadIdleTimeout)
+	return response, nil
+}
+
+type transferBody struct {
+	io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	idle   *time.Timer
+}
+
+func (b *transferBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && context.Cause(b.ctx) == errDownloadIdle {
+		return n, errDownloadIdle
+	}
+	if n > 0 {
+		b.idle.Reset(downloadIdleTimeout)
+	}
+	return n, err
+}
+
+func (b *transferBody) Close() error {
+	b.idle.Stop()
+	b.cancel(nil)
+	return b.ReadCloser.Close()
+}
 
 // copyHTTP keeps small files on one request. Large files use disjoint writes
 // when the server supports ranges, with a fresh single response as fallback.
@@ -38,7 +89,7 @@ func copyHTTP(ctx context.Context, source string, response *http.Response, file 
 			progress(-1, size)
 		}
 		var err error
-		response, err = get(ctx, source)
+		response, err = getTransfer(ctx, source, "")
 		if err != nil {
 			return 0, err
 		}
@@ -95,7 +146,7 @@ func writeRanges(ctx context.Context, source string, file *os.File, size int64, 
 
 func writeRange(ctx context.Context, source string, file *os.File, start, end, size int64, etag string, progress func(int64, int64)) error {
 	rangeHeader := fmt.Sprintf("bytes=%d-%d", start, end)
-	res, err := getHTTP(ctx, source, rangeHeader)
+	res, err := getTransfer(ctx, source, rangeHeader)
 	if err != nil {
 		return err
 	}

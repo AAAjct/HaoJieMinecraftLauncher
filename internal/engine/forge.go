@@ -35,25 +35,22 @@ func recommendedForge(ctx context.Context, version string) (string, error) {
 	return "", fmt.Errorf("Forge 暂无 Minecraft %s 的推荐或最新构建", version)
 }
 
-func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gameProfile, status func(string)) (gameProfile, error) {
-	ctx = e.resumableDownloads(ctx)
-	var overlay gameProfile
-	name, artifactName, repository := "Forge", "forge", forgeMaven
+func (e Engine) downloadForgeFamilyInstaller(ctx context.Context, i Instance, name string, status func(string)) (string, error) {
+	artifactName, repository := "forge", forgeMaven
 	group := "net/minecraftforge"
 	build := i.Version + "-" + i.Build
 	if i.Loader == "neoforge" {
-		name = "NeoForge"
 		group = "net/neoforged"
 		artifactName = neoForgeArtifact(i.Version)
 		repository = neoForgeMaven + artifactName + "/"
 		if !neoForgeMatches(i.Version, i.Build) {
-			return overlay, fmt.Errorf("NeoForge %s 与 Minecraft %s 不兼容", i.Build, i.Version)
+			return "", fmt.Errorf("NeoForge %s 与 Minecraft %s 不兼容", i.Build, i.Version)
 		}
 		if i.Version != "1.20.1" {
 			build = i.Build
 		}
 	} else if !forgeBuild.MatchString(i.Build) {
-		return overlay, fmt.Errorf("Forge 构建版本无效")
+		return "", fmt.Errorf("Forge 构建版本无效")
 	}
 	prefix := artifactName + "-" + build
 	addr := repository + build + "/" + prefix + "-installer.jar"
@@ -65,9 +62,14 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	cacheRoot := filepath.Join(shared, group, i.Loader, cacheBuild)
 	installer := filepath.Join(cacheRoot, prefix+"-installer.jar")
 	status("下载 " + name + " 安装器 · " + i.Build)
-	if err := downloadForgeInstaller(ctx, addr, installer); err != nil {
-		return overlay, fmt.Errorf("下载 %s 安装器：%w", name, err)
+	if err := downloadForgeInstaller(ctx, addr, installer, "下载 "+name+" 安装器", status); err != nil {
+		return "", fmt.Errorf("下载 %s 安装器：%w", name, err)
 	}
+	return installer, nil
+}
+
+func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gameProfile, name, installer, java string, status func(string)) (gameProfile, error) {
+	var overlay gameProfile
 	z, err := zip.OpenReader(installer)
 	if err != nil {
 		return overlay, err
@@ -83,10 +85,6 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	if err := installerJSON(&z.Reader, "install_profile.json", &installProfile); err != nil {
 		return overlay, fmt.Errorf("读取 %s 安装清单：%w", name, err)
 	}
-	java, err := e.EnsureJava(ctx, base.JavaVersion.MajorVersion, status)
-	if err != nil {
-		return overlay, err
-	}
 	stage, err := makeCacheStage(ctx, ".installer-")
 	if err != nil {
 		return overlay, err
@@ -96,10 +94,6 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 		return overlay, err
 	}
 	jar := e.baseVersionFile(i.Version, ".jar")
-	status("正在准备 " + name + " 所需的 Minecraft 客户端…")
-	if err := (transfer{minecraftClient(base), jar}).ensure(ctx); err != nil {
-		return overlay, err
-	}
 	vanilla := filepath.Join(stage, "versions", i.Version)
 	if err := os.MkdirAll(vanilla, 0700); err != nil {
 		return overlay, err
@@ -117,16 +111,20 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	libRoot := filepath.Join(stage, "libraries")
 	libraries := append(append(installProfile.Libraries, overlay.Libraries...), base.Libraries...)
 	status("正在准备 " + name + " 运行库…")
-	if err := e.prepareInstallerLibraries(ctx, &z.Reader, libRoot, libraries, status); err != nil {
+	if err := e.prepareInstallerLibraries(ctx, &z.Reader, libRoot, libraries, name, status); err != nil {
 		return overlay, err
 	}
 	status("正在执行 " + name + " 安装处理器…")
-	if err := runForgeInstaller(ctx, name, java, installer, stage, filepath.Join(cacheRoot, prefix+"-install-*.log"), status); err != nil {
+	logPath := strings.TrimSuffix(installer, "-installer.jar") + "-install-*.log"
+	if err := trackStage(ctx, "安装 "+name, func(ctx context.Context) error {
+		return runForgeInstaller(ctx, name, java, installer, stage, logPath, status)
+	}); err != nil {
 		return overlay, err
 	}
 	if err := readJSON(filepath.Join(stage, "versions", overlay.ID, overlay.ID+".json"), &overlay); err != nil {
 		return overlay, err
 	}
+	shared := filepath.Join(e.gameRoot(), "libraries")
 	err = filepath.WalkDir(libRoot, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil || entry.IsDir() {
 			return err
@@ -153,7 +151,7 @@ func (e Engine) installForgeFamily(ctx context.Context, i Instance, base gamePro
 	return overlay, err
 }
 
-func downloadForgeInstaller(ctx context.Context, addr, target string) error {
+func downloadForgeInstaller(ctx context.Context, addr, target, label string, status func(string)) error {
 	mirror := minecraftMirror(addr)
 	var sources []catalogSource[string]
 	for _, address := range []string{mirror, neoForgeCDN(addr), addr} {
@@ -182,7 +180,7 @@ func downloadForgeInstaller(ctx context.Context, addr, target string) error {
 		return err
 	}
 	file := withMinecraftMirror(artifact{URL: addr, SHA1: checksum}, mirror)
-	return (transfer{file, target}).ensure(ctx)
+	return ensureAll(ctx, []transfer{{file, target}}, label, status)
 }
 
 func installerJSON(archive *zip.Reader, name string, out any) error {
@@ -194,8 +192,10 @@ func installerJSON(archive *zip.Reader, name string, out any) error {
 	return json.NewDecoder(io.LimitReader(file, 8<<20)).Decode(out)
 }
 
-func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Reader, target string, libraries []library, status func(string)) error {
+func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Reader, target string, libraries []library, name string, status func(string)) error {
 	shared := filepath.Join(e.gameRoot(), "libraries")
+	const analysis = "分析加载器运行库"
+	pendingStage(ctx, analysis)
 	var work []transfer
 	seen := make(map[string]bool)
 	for _, lib := range libraries {
@@ -241,7 +241,8 @@ func (e Engine) prepareInstallerLibraries(ctx context.Context, archive *zip.Read
 			work = append(work, transfer{withMinecraftMirror(file, minecraftMirror(file.URL)), path})
 		}
 	}
-	return ensureAll(ctx, work, "下载加载器运行库", status)
+	reportStage(ctx, StageProgress{Label: analysis, Fraction: 1})
+	return ensureAll(ctx, work, "下载 "+name+" 运行库", status)
 }
 
 func runForgeInstaller(ctx context.Context, name, java, installer, stage, logPath string, status func(string)) error {
@@ -259,7 +260,9 @@ func runForgeInstaller(ctx context.Context, name, java, installer, stage, logPat
 	defer log.Close()
 	logPath = log.Name()
 	cmd := exec.CommandContext(ctx, filepath.Join(java, "bin", "java.exe"),
-		"-Djava.awt.headless=true", "-Djava.io.tmpdir="+temp, "-jar", installer, "--installClient", stage)
+		"-Djava.awt.headless=true", "-Djava.io.tmpdir="+temp,
+		"-Djavax.net.ssl.trustStoreType=Windows-ROOT", "-Djavax.net.ssl.trustStore=NONE",
+		"-jar", installer, "--installClient", stage)
 	cmd.Dir = stage
 	cmd.Env = append(os.Environ(), "TEMP="+temp, "TMP="+temp)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windowsNoConsole}

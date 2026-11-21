@@ -15,11 +15,18 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/nwaples/rardecode/v2"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const packEntryLimit = 512 << 20
+const (
+	packManifestStage  = "读取整合包清单"
+	packResourcesStage = "下载整合包资源"
+	packOverridesStage = "解压整合包文件"
+)
 
 type packEntry struct {
 	name string
@@ -61,7 +68,15 @@ func walkPack(ctx context.Context, file string, visit func(packEntry) error) err
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := visit(packEntry{entry.Name, entry.Mode(), int64(entry.UncompressedSize64), entry.Open}); err != nil {
+		name := entry.Name
+		if !utf8.ValidString(name) {
+			decoded, err := simplifiedchinese.GB18030.NewDecoder().String(name)
+			if err != nil || strings.ContainsRune(decoded, utf8.RuneError) {
+				return fmt.Errorf("无法解码 ZIP 条目名称 %q", name)
+			}
+			name = decoded
+		}
+		if err := visit(packEntry{name, entry.Mode(), int64(entry.UncompressedSize64), entry.Open}); err != nil {
 			return err
 		}
 	}
@@ -79,6 +94,7 @@ var errPackManifestFound = errors.New("找到整合包清单")
 
 func (e Engine) ImportPack(ctx context.Context, file string, status func(string)) (Instance, error) {
 	ctx = e.resumableDownloads(ctx)
+	reportStage(ctx, StageProgress{Label: packManifestStage, Fraction: -1, Remaining: -1, Planning: true})
 	status("正在读取整合包清单…")
 	var manifest, root string
 	var data []byte
@@ -218,7 +234,7 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 	if filepath.IsAbs(meta.Overrides) || !fs.ValidPath(meta.Overrides) || meta.Overrides == "." || strings.Contains(meta.Overrides, "\\") {
 		return Instance{}, fmt.Errorf("无效的 CurseForge 覆盖目录")
 	}
-	return e.createInstance(ctx, instance, archive, func(game string) error {
+	return e.createInstance(ctx, instance, archive, func(ctx context.Context, game string, status func(string)) error {
 		status("正在读取 CurseForge 整合包文件…")
 		required := meta.Files[:0]
 		for _, entry := range meta.Files {
@@ -232,6 +248,8 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 		}
 		const batchSize = 50
 		batches := slices.Collect(slices.Chunk(required, batchSize))
+		rows := make([]curseFile, len(required))
+		batchErrors := make([]error, len(batches))
 		work := make([]transfer, len(required))
 		err := fetchPackEntries(ctx, len(batches), func(ctx context.Context, i int) error {
 			batch := batches[i]
@@ -241,32 +259,37 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 			}
 			files, err := curseGetFiles(ctx, ids)
 			if err != nil {
-				return err
+				batchErrors[i] = err
+				return ctx.Err()
 			}
 			byID := make(map[int]curseFile, len(files))
 			for _, file := range files {
 				byID[file.ID] = file
 			}
 			for n, entry := range batch {
-				row, ok := byID[entry.FileID]
-				if !ok {
-					row, err = curseGetFile(ctx, entry.ProjectID, entry.FileID)
-					if err != nil {
-						return fmt.Errorf("CurseForge 文件 %d/%d：%w", entry.ProjectID, entry.FileID, err)
-					}
-				}
-				if row.ModID != entry.ProjectID {
-					return fmt.Errorf("CurseForge 文件 %d/%d 的元数据不匹配", entry.ProjectID, entry.FileID)
-				}
-				item, err := cursePackTransfer(ctx, game, row)
-				if err != nil {
-					return err
-				}
-				work[i*batchSize+n] = item
+				rows[i*batchSize+n] = byID[entry.FileID]
 			}
 			return nil
 		})
 		if err != nil {
+			return err
+		}
+		if slices.ContainsFunc(rows, func(row curseFile) bool { return row.ID == 0 }) {
+			status("正在逐个查询 CurseForge 文件信息…")
+		}
+		if err := fetchPackEntries(ctx, len(required), func(ctx context.Context, i int) error {
+			entry, row := required[i], rows[i]
+			if row.ModID != entry.ProjectID {
+				var err error
+				row, err = curseGetFile(ctx, entry.ProjectID, entry.FileID)
+				if err != nil {
+					return fmt.Errorf("CurseForge 文件 %d/%d：%w", entry.ProjectID, entry.FileID, errors.Join(err, batchErrors[i/batchSize]))
+				}
+			}
+			var err error
+			work[i], err = cursePackTransfer(ctx, game, filepath.Dir(archive), row)
+			return err
+		}); err != nil {
 			return err
 		}
 		seen := make(map[string]bool, len(work))
@@ -277,23 +300,19 @@ func (e Engine) importCursePack(ctx context.Context, archive, root string, data 
 			}
 			seen[key] = true
 		}
-		if err := ensureAll(ctx, work, "下载整合包资源", status); err != nil {
+		if err := ensureAll(ctx, work, packResourcesStage, status); err != nil {
 			return curseDownloadError(err)
 		}
-		return unpackOverrides(ctx, archive, game, root+meta.Overrides+"/")
+		return trackStage(ctx, packOverridesStage, func(ctx context.Context) error {
+			return unpackOverrides(ctx, archive, game, root+meta.Overrides+"/")
+		})
 	}, status)
 }
 
-func cursePackTransfer(ctx context.Context, game string, row curseFile) (transfer, error) {
+func cursePackTransfer(ctx context.Context, game, localDir string, row curseFile) (transfer, error) {
 	file := row.resourceFile()
-	if file.URL == "" && row.ModID > 0 && row.ID > 0 && segment(file.Filename) && validAssetHash(file.SHA1) {
-		file.URL = fmt.Sprintf("https://www.curseforge.com/api/v1/mods/%d/files/%d/download", row.ModID, row.ID)
-	} else {
-		var err error
-		file, err = row.version("mod").selectedFile("")
-		if err != nil {
-			return transfer{}, err
-		}
+	if !segment(file.Filename) || !validAssetHash(file.SHA1) {
+		return transfer{}, fmt.Errorf("CurseForge 文件 %d/%d 缺少有效文件名或 SHA-1", row.ModID, row.ID)
 	}
 	folder := "mods"
 	if !strings.EqualFold(filepath.Ext(file.Filename), ".jar") {
@@ -310,7 +329,23 @@ func cursePackTransfer(ctx context.Context, game string, row curseFile) (transfe
 			return transfer{}, fmt.Errorf("不支持自动安装整合包文件 %s", file.Filename)
 		}
 	}
-	return file.transfer(filepath.Join(game, folder)), nil
+	item := file.transfer(filepath.Join(game, folder))
+	if local := filepath.Join(localDir, file.Filename); regularFile(local) {
+		item.localSource = local
+	} else if !validCurseDownload(item.URL) {
+		address, err := curseDownloadURL(ctx, row.ModID, row.ID)
+		if ctx.Err() != nil {
+			return transfer{}, ctx.Err()
+		}
+		if err != nil {
+			address = curseCDNFileURL(row.ID, file.Filename)
+			if address == "" {
+				return transfer{}, fmt.Errorf("%s 缺少有效的 CurseForge 下载地址：%w", file.Filename, err)
+			}
+		}
+		item.URL = address
+	}
+	return item, nil
 }
 
 func fetchPackEntries(ctx context.Context, count int, fetch func(context.Context, int) error) error {

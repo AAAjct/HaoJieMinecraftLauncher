@@ -5,7 +5,7 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 ## 快速开始
 
 1. 从 [GitHub Releases](https://github.com/AAAjct/HaoJieMinecraftLauncher/releases/latest) 下载 `HJML.exe`，放在有写入权限的文件夹后运行。Windows 文件属性中的版权为 Jct，语言为简体中文。
-2. 在 **下载 → 游戏版本** 中创建实例。支持原版，以及 Fabric、采用现代安装格式的 Forge 和 NeoForge。启动器在需要时自动下载 Zulu JDK 8、17、21 或 25。要求 Java 16 的 Minecraft 版本使用 Java 17。
+2. 在 **下载 → 游戏版本** 中创建实例。支持原版，以及 Fabric、采用现代安装格式的 Forge 和 NeoForge。启动器在需要时优先从国内镜像下载 Temurin JDK 8、17、21 或 25，也可复用已安装的 Zulu JDK。要求 Java 16 的 Minecraft 版本使用 Java 17。
 3. 在 **启动** 页填写离线玩家名，选择实例并启动。所需文件下载齐全后可以离线运行。游戏运行时，右下角的 **×** 可结束由启动器启动的所有 Minecraft 实例。
 
 - 点击 **再次启动** 可多开同一实例。各进程单独计算可分配内存。追加启动使用独立的游戏选项副本，共用实例的存档、模组等内容，日志保存在实例目录下的 `hjml-launch-*.log`。
@@ -19,10 +19,10 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 | 模组、光影、资源包 | 安装到兼容实例的 `mods/`、`shaderpacks/`、`resourcepacks/` |
 | 数据包 | 选择实例和现有世界，安装到该存档的 `datapacks/` |
 
-- 游戏版本和资源可以同时下载安装。打开 **任务** 查看进度或单独取消。支持校验和续传的下载在任务内重试时可接着下载。任务结束时会清理对应的临时下载和续传文件。
-- 有可用国内镜像时先请求镜像，再自动回退官方源。Minecraft 使用 BMCLAPI，Modrinth 和 CurseForge 使用 MCIM。需要访问 CurseForge 官方 API 或 CDN 时，可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`。
+- Minecraft 客户端、加载器下载和 Zulu JDK 会并行准备。游戏版本和资源也可以同时下载安装。打开 **任务** 查看总进度、下载速度、剩余文件和各阶段进度，也可单独取消任务。支持校验和续传的下载在任务内重试时可接着下载。任务结束时会清理对应的临时下载和续传文件。
+- Minecraft 和 Modrinth 优先使用 BMCLAPI 和 MCIM 镜像。CurseForge 公共文件优先使用 mediafilez CDN，失败时尝试 MCIM 和 edge CDN。需要访问 CurseForge 官方 API 或 CDN 时，可在启动器进程的环境变量中设置自己的 `CURSEFORGE_API_KEY`。
 - 在 **下载** 页可切换 Modrinth 或 CurseForge。模组和整合包的加载器筛选提供 Fabric、Forge 和 NeoForge。
-- 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge API 未返回下载地址时，会尝试通过 CurseForge 网站下载并校验文件。
+- 在 **实例管理 → 我的实例 → 导入** 或 **下载 → 整合包 → 从文件安装** 选择整合包，也可直接拖入。支持含 Modrinth 或 CurseForge 清单的 ZIP、RAR，以及 Modrinth 的 MRPACK。导入会直接创建新实例。CurseForge 未提供下载地址时，启动器会根据文件 ID 和文件名尝试 CDN，并校验文件。
 - 在 **实例管理 → 从文件安装** 可多选 JAR 模组。系统文件对话框确认后，模组会直接安装到打开对话框时选中的实例。直接拖入 JAR 时会显示目标实例确认。
 - **实例管理** 支持改名、打开目录、刷新模组、启用、禁用及删除。
 - 原版实例默认用 Minecraft 版本命名。手动安装带加载器的实例默认包含构建号，例如 `26.3-fabric_0.20.1`。整合包使用去掉扩展名的压缩包文件名作为版本目录及启动文件的名称。同名时会自动追加首个可用的 `(1)`、`(2)` 等编号。
@@ -33,8 +33,8 @@ HJML 是用 Go 和 MyGo 开发的 Minecraft Java 版启动器，支持 Windows x
 | 位置 | 内容 |
 | --- | --- |
 | EXE 同级的 `.minecraft/` | 共享运行库、资源、`.hjml-cache/` 中的共享客户端，以及 `versions/<实例目录>/` 下的实例数据 |
-| `.minecraft/.hjm-cache/temp/` | 临时下载、续传分片及安装器工作文件，使用结束后清理 |
-| EXE 同级的 `jdk/zulu <主版本>/` | 已安装的 Zulu JDK |
+| `.minecraft/.hjml-cache/temp/` | 临时下载、续传分片及安装器工作文件，使用结束后清理 |
+| EXE 同级的 `jdk/temurin <主版本>/`、`jdk/zulu <主版本>/` | 已安装的 JDK |
 | `%LOCALAPPDATA%\HJML` | 启动器设置、版本目录缓存以及旧版实例 |
 | 实例目录的 `hjml-latest.log` | 最近一次游戏启动日志 |
 

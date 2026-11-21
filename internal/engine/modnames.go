@@ -28,7 +28,7 @@ type ModNames struct {
 }
 
 func (e Engine) LoadModNames(ctx context.Context) (*ModNames, error) {
-	dir := filepath.Join(e.gameRoot(), ".hjml-cache")
+	dir := e.cacheDir()
 	path := filepath.Join(dir, "mcmod.buf")
 	data, err := os.ReadFile(path)
 	if err == nil && validModNames(data) {

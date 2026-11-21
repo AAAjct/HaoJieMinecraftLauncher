@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 type Account struct {
@@ -28,12 +29,17 @@ type Game struct {
 	Memory   int
 	process  *os.Process
 	Stopping bool
+	// Crash is available after receiving from Done.
+	Crash *GameCrash
 }
 
 func (g *Game) Stop() error {
 	err := g.process.Kill()
-	if err == nil || errors.Is(err, os.ErrProcessDone) {
+	if err == nil {
 		g.Stopping = true
+		return nil
+	}
+	if errors.Is(err, os.ErrProcessDone) {
 		return nil
 	}
 	return err
@@ -129,11 +135,21 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if memory < 1024 || memory > 32768 {
 		return nil, fmt.Errorf("内存上限须为 1024–32768 MiB")
 	}
-	profile, err := e.profile(ctx, instance, status)
+	instanceDir := e.GameDir(instance)
+	if _, err := os.Stat(instanceDir); err != nil {
+		return nil, err
+	}
+	minimumJava, mod, err := fabricJavaMinimum(ctx, instanceDir, instance.Loader)
 	if err != nil {
 		return nil, err
 	}
-	javaHome, err := e.EnsureJava(ctx, profile.JavaVersion.MajorVersion, status)
+	if minimumJava > 0 {
+		if _, err := launcherJavaMajor(minimumJava); err != nil {
+			return nil, fmt.Errorf("模组 %s 要求 Java %d 或更高版本：%w", mod, minimumJava, err)
+		}
+		status(fmt.Sprintf("模组 %s 要求 Java %d 或更高版本…", mod, minimumJava))
+	}
+	profile, javaHome, err := e.prepareGame(ctx, instance, minimumJava, status)
 	if err != nil {
 		return nil, err
 	}
@@ -141,15 +157,11 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if err != nil {
 		return nil, err
 	}
-	assetFiles, err := e.assetTransfers(ctx, profile)
+	assetFiles, err := e.assetTransfers(ctx, profile, status)
 	if err != nil {
 		return nil, err
 	}
 	if err := ensureAll(ctx, append(files, assetFiles...), "检查客户端文件和资源", status); err != nil {
-		return nil, err
-	}
-	instanceDir := e.GameDir(instance)
-	if _, err := os.Stat(instanceDir); err != nil {
 		return nil, err
 	}
 	game := instanceDir
@@ -205,7 +217,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		"${version_name}", versionName, "${version_type}", "HJML",
 		"${game_directory}", game, "${assets_root}", assets, "${game_assets}", gameAssets,
 		"${assets_index_name}", profile.AssetIndex.ID, "${natives_directory}", native,
-		"${launcher_name}", "HJML", "${launcher_version}", "1.0.6",
+		"${launcher_name}", "HJML", "${launcher_version}", "1.0.7",
 		"${library_directory}", filepath.Join(e.gameRoot(), "libraries"), "${classpath_separator}", ";",
 		"${classpath}", strings.Join(classpath, ";"),
 	)
@@ -217,6 +229,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	if len(jvmArgs) == 0 {
 		jvmArgs = []string{"-Djava.library.path=" + native, "-cp", strings.Join(classpath, ";")}
 	}
+	jvmArgs = append(jvmArgs, "-XX:ErrorFile="+filepath.Join(instanceDir, "hs_err_pid%p.log"))
 	if file := profile.Logging.Client.File; file.ID != "" && profile.Logging.Client.Argument != "" {
 		jvmArgs = append(jvmArgs, strings.ReplaceAll(profile.Logging.Client.Argument, "${path}",
 			filepath.Join(assets, "log_configs", file.ID)))
@@ -252,15 +265,18 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 	cmd.Stdout, cmd.Stderr = log, log
 	cmd.Env = append(os.Environ(), "JAVA_HOME="+javaHome)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windowsNoConsole}
+	startedAt := time.Now()
 	if err := cmd.Start(); err != nil {
 		log.Close()
 		return nil, err
 	}
 	started = true
 	done := make(chan error, 1)
+	running := &Game{Done: done, LogPath: log.Name(), Memory: memory, process: cmd.Process}
 	go func() {
 		err := cmd.Wait()
 		log.Close()
+		running.Crash = diagnoseGameExit(err, running.LogPath, instanceDir, game, cmd.Process.Pid, startedAt)
 		os.RemoveAll(native)
 		if session != nil {
 			session.close()
@@ -268,7 +284,7 @@ func (e Engine) Launch(ctx context.Context, instance Instance, account Account, 
 		done <- err
 		close(done)
 	}()
-	return &Game{Done: done, LogPath: log.Name(), Memory: memory, process: cmd.Process}, nil
+	return running, nil
 }
 
 const windowsNoConsole = 0x08000000

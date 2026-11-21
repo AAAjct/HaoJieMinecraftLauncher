@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync"
+
 	"time"
 )
 
@@ -127,33 +127,4 @@ func fetchJSON(ctx context.Context, url string, result any) error {
 		last = err
 	}
 	return last
-}
-
-type downloadProgress struct {
-	mu       sync.Mutex
-	start    time.Time
-	received int64
-	last     time.Time
-	label    string
-	status   func(string)
-}
-
-func (p *downloadProgress) add(n, total int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if n < 0 {
-		p.received = 0
-		p.start = time.Now()
-	} else {
-		p.received += n
-	}
-	if time.Since(p.last) >= 250*time.Millisecond {
-		rate := float64(p.received) / (1 << 20) / max(time.Since(p.start).Seconds(), 0.1)
-		if total > 0 {
-			p.status(fmt.Sprintf("正在下载 %s · %d%% · %.1f MiB/s", p.label, p.received*100/total, rate))
-		} else {
-			p.status(fmt.Sprintf("正在下载 %s · %.1f MB", p.label, float64(p.received)/(1<<20)))
-		}
-		p.last = time.Now()
-	}
 }

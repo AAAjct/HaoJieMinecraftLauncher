@@ -10,6 +10,15 @@ const mcim = "https://mod.mcimirror.top"
 
 func (a artifact) orderedSources() []string {
 	sources := slices.Clone(a.Mirrors)
+	u, err := url.Parse(a.URL)
+	if err == nil && u.Scheme == "https" && u.User == nil && curseForgeCDN(u.Host) &&
+		a.SHA1 != "" && u.RawQuery == "" && strings.HasPrefix(u.Path, "/files/") {
+		cdn := *u
+		cdn.Host = "mediafilez.forgecdn.net"
+		sources = append(sources, cdn.String(), resourceMirror(a.URL))
+		cdn.Host = "edge.forgecdn.net"
+		return append(append(sources, cdn.String()), a.Alternates...)
+	}
 	if mirror := resourceMirror(a.URL); mirror != "" && (a.SHA1 != "" || a.SHA512 != "") {
 		sources = append(sources, mirror)
 	}

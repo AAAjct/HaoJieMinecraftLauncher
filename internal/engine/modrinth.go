@@ -160,7 +160,12 @@ func (v ResourceVersion) selectedFile(extension string) (resourceFile, error) {
 		}
 	}
 	if strings.HasPrefix(v.ID, cursePrefix) && candidate.Filename != "" && candidate.URL == "" {
-		return resourceFile{}, fmt.Errorf("CurseForge 未提供 %s 的第三方下载地址", candidate.Filename)
+		if id, err := strconv.Atoi(strings.TrimPrefix(v.ID, cursePrefix)); err == nil && validAssetHash(candidate.SHA1) {
+			if address := curseCDNFileURL(id, candidate.Filename); address != "" {
+				candidate.URL = address
+				return candidate, nil
+			}
+		}
 	}
 	return resourceFile{}, fmt.Errorf("%s 没有可校验的下载文件", v.Name)
 }
@@ -423,9 +428,11 @@ func (e Engine) DownloadPack(ctx context.Context, version ResourceVersion, statu
 		return Instance{}, err
 	}
 	defer os.RemoveAll(stage)
-	status("正在下载整合包清单…")
 	item := file.transfer(stage)
-	if err := item.ensure(ctx); err != nil {
+	const archiveStage = "下载整合包压缩包"
+	planStages(ctx, archiveStage)
+	reportStage(ctx, StageProgress{Label: packManifestStage, Fraction: -1, Remaining: -1, Planning: true})
+	if err := ensureAll(ctx, []transfer{item}, archiveStage, status); err != nil {
 		return Instance{}, curseDownloadError(err)
 	}
 	return e.ImportPack(ctx, item.target, status)
@@ -454,16 +461,18 @@ func (e Engine) importModrinthPack(ctx context.Context, archive, root string, da
 			return Instance{}, fmt.Errorf("该整合包要求当前版本尚未支持的 %s 加载器", id)
 		}
 	}
-	return e.createInstance(ctx, instance, archive, func(game string) error {
+	return e.createInstance(ctx, instance, archive, func(ctx context.Context, game string, status func(string)) error {
 		if err := installPackFiles(ctx, game, index, status); err != nil {
 			return err
 		}
-		for _, prefix := range []string{"overrides/", "client-overrides/"} {
-			if err := unpackOverrides(ctx, archive, game, root+prefix); err != nil {
-				return err
+		return trackStage(ctx, packOverridesStage, func(ctx context.Context) error {
+			for _, prefix := range []string{"overrides/", "client-overrides/"} {
+				if err := unpackOverrides(ctx, archive, game, root+prefix); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			return nil
+		})
 	}, status)
 }
 
@@ -493,5 +502,5 @@ func installPackFiles(ctx context.Context, game string, index packIndex, status 
 		}
 		work = append(work, transfer{artifact{URL: sources[0], Alternates: sources[1:], Size: entry.FileSize, SHA512: entry.Hashes.SHA512}, target})
 	}
-	return ensureAll(ctx, work, "下载整合包资源", status)
+	return ensureAll(ctx, work, packResourcesStage, status)
 }

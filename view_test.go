@@ -402,8 +402,13 @@ func TestDownloadCategoriesAndLocalImportLayout(t *testing.T) {
 func TestParallelDownloadJobsKeepSeparateTargets(t *testing.T) {
 	a := newApp(engine.Engine{DataDir: t.TempDir()})
 	a.jobs = []*job{
-		{kind: downloadJob, key: "mod-one", title: "模组一", target: "fabric", cancel: func() {}},
-		{kind: downloadJob, key: "mod-two", title: "模组二", target: "fabric", cancel: func() {}},
+		{kind: downloadJob, key: "mod-one", title: "模组一", target: "fabric", cancel: func() {},
+			stages: []engine.StageProgress{
+				{Label: "下载 Minecraft 客户端", Fraction: 0.24, Remaining: 1, BytesPerSecond: 3 << 10},
+				{Label: "准备 Zulu JDK 21", Fraction: -1, Remaining: -1},
+			}},
+		{kind: downloadJob, key: "mod-two", title: "模组二", target: "fabric", cancel: func() {},
+			stages: []engine.StageProgress{{Label: "下载 NeoForge 安装器", Fraction: 0.15, Remaining: 1, BytesPerSecond: 2 << 10}}},
 	}
 	if a.downloadCount() != 2 || !a.downloading("mod-one", "fabric") || a.downloading("mod-three", "fabric") ||
 		!a.inUse(engine.Instance{ID: "fabric"}) || a.gameInUse(engine.Instance{ID: "fabric"}) {
@@ -411,11 +416,55 @@ func TestParallelDownloadJobsKeepSeparateTargets(t *testing.T) {
 	}
 	a.page = tasksPage
 	test := ui.NewTester(a.view, 1020, 675)
+	for _, label := range []string{"总进度", "13.00%", "下载速度", "5 KiB/s", "剩余文件", "2",
+		"下载 Minecraft 客户端", "准备 Zulu JDK 21", "下载 NeoForge 安装器", "24%", "15%", "•••"} {
+		if !test.HasText(label) {
+			t.Errorf("task workspace missing %q", label)
+		}
+	}
 	if err := test.Click("取消 模组一"); err != nil {
 		t.Fatal(err)
 	}
 	if !a.jobs[0].cancelling || a.jobs[1].cancelling {
 		t.Fatal("cancelling one download affected another")
+	}
+}
+
+func TestCrashDialogShowsDiagnosisAndQueuesCrashes(t *testing.T) {
+	a := newApp(engine.Engine{DataDir: t.TempDir()})
+	crash := &engine.GameCrash{
+		Reason: "模组的 Mixin 注入失败，可能存在模组冲突或版本不匹配。",
+		Detail: "MixinApplyError: renderer", Mods: []string{"oculus.jar", "embeddium.jar"}, ExitCode: 1,
+	}
+	a.gameExited("正常退出", &engine.Game{}, nil)
+	a.gameExited("主动结束", &engine.Game{Stopping: true, Crash: crash}, nil)
+	if len(a.crashes) != 0 {
+		t.Fatal("normal exits and requested stops must not open the crash dialog")
+	}
+	a.gameExited("第一个实例", &engine.Game{Crash: crash}, nil)
+	a.gameExited("第二个实例", &engine.Game{Crash: &engine.GameCrash{Reason: "Java 内存不足。"}}, nil)
+	test := ui.NewTester(a.view, 830, 565)
+	for _, label := range []string{"Minecraft 异常退出", crash.Reason, crash.Detail, "oculus.jar", "查看日志", "导出错误报告"} {
+		if !test.HasText(label) {
+			t.Errorf("crash dialog missing %q", label)
+		}
+	}
+	test.Key(0, ui.KeyEnter)
+	test.Frame()
+	if len(a.crashes) != 2 {
+		t.Fatal("dialog action was selected by default")
+	}
+	if err := test.Click("关闭"); err != nil {
+		t.Fatal(err)
+	}
+	test.Frame()
+	if len(a.crashes) != 1 || !test.HasText("Java 内存不足。") {
+		t.Fatal("closing a crash should show the next one")
+	}
+	test.Key(0, ui.KeyEscape)
+	test.Frame()
+	if len(a.crashes) != 0 {
+		t.Fatal("Escape should dismiss the last crash")
 	}
 }
 

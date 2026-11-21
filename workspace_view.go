@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"regexp"
 	"strconv"
 
 	"github.com/egoist/mygo/ui"
@@ -39,74 +38,97 @@ func (a *app) downloadSidebar(c *ui.Context) {
 	})
 }
 
-var ratioPattern = regexp.MustCompile(`([0-9]+)/([0-9]+)`)
-var percentPattern = regexp.MustCompile(`([0-9]+(?:\.[0-9]+)?)%`)
-var ratePattern = regexp.MustCompile(`([0-9]+\.[0-9]+ MiB/s)`)
-
-func taskProgress(message string) (progress float64, remaining string) {
-	progress, remaining = -1, "—"
-	if counts := ratioPattern.FindStringSubmatch(message); len(counts) == 3 {
-		done, _ := strconv.Atoi(counts[1])
-		total, _ := strconv.Atoi(counts[2])
-		if total > 0 {
-			progress = min(1, float64(done)/float64(total))
-			remaining = strconv.Itoa(max(0, total-done))
-		}
-	}
-	if percent := percentPattern.FindStringSubmatch(message); len(percent) == 2 {
-		value, _ := strconv.ParseFloat(percent[1], 64)
-		progress = min(1, value/100)
-	}
-	return progress, remaining
-}
-
 func (a *app) taskSidebar(c *ui.Context) {
-	sidebar(c).Children(func() {
-		percentage, rate, remaining := "—", "—", "—"
-		count := a.downloadCount()
-		if count > 1 {
-			ui.Textf(c, "%d 个下载任务进行中", count).FontSize(16).Bold()
-			return
+	percentage, rate, remaining := "—", "—", "—"
+	var progress, bytesPerSecond float64
+	var stages, files int
+	filesKnown, planning, incomplete := false, false, false
+	for _, task := range a.jobs {
+		if task.cancelling || (task.kind != downloadJob && task.kind != importJob && task.kind != launchJob) {
+			continue
 		}
-		if task := a.activeJob(downloadJob); task != nil {
-			progress, left := taskProgress(task.message)
-			remaining = left
-			if progress >= 0 {
-				percentage = fmt.Sprintf("%.1f%%", progress*100)
-			}
-			if match := ratePattern.FindStringSubmatch(task.message); len(match) == 2 {
-				rate = match[1]
+		for _, stage := range task.stages {
+			stages++
+			planning = planning || stage.Planning
+			incomplete = incomplete || stage.Fraction < 1 || stage.Remaining > 0
+			progress += max(0, stage.Fraction)
+			bytesPerSecond += stage.BytesPerSecond
+			if stage.Remaining > 0 {
+				filesKnown = true
+				files += stage.Remaining
 			}
 		}
+	}
+	if stages > 0 {
+		if !planning {
+			total := 100 * progress / float64(stages)
+			if incomplete {
+				total = min(total, 99.99)
+			}
+			percentage = fmt.Sprintf("%.2f%%", total)
+		}
+		rate = fmt.Sprintf("%.0f KiB/s", bytesPerSecond/1024)
+		if bytesPerSecond >= 1<<20 {
+			rate = fmt.Sprintf("%.1f MiB/s", bytesPerSecond/(1<<20))
+		}
+		if filesKnown || !incomplete {
+			remaining = strconv.Itoa(files)
+		}
+	}
+	ui.Column(c).Grow(1).Justify(ui.Center).AlignItems(ui.Center).Gap(46).Children(func() {
 		for _, row := range []struct{ label, value string }{
-			{"当前阶段", percentage}, {"下载速率", rate}, {"待处理文件", remaining},
+			{"总进度", percentage}, {"下载速度", rate}, {"剩余文件", remaining},
 		} {
-			ui.Column(c).Padding(12).Gap(6).Children(func() {
-				ui.Text(c, row.label).FontSize(13).TextColor(a.theme.TextMuted)
-				ui.Text(c, row.value).FontSize(24).Bold().TextColor(highlight)
+			ui.Column(c).AlignItems(ui.Center).Gap(8).Children(func() {
+				ui.Text(c, row.label).FontSize(15).TextColor(highlight)
+				ui.Row(c).Width(146).Height(1).Background(blue)
+				ui.Text(c, row.value).FontSize(24).Bold()
 			})
 		}
 	})
 }
 
 func (a *app) taskView(c *ui.Context) {
-	panel(c).Children(func() {
-		ui.Text(c, "任务管理").FontSize(22).Bold()
-		if len(a.jobs) == 0 {
-			ui.Text(c, "当前没有运行中的任务。").TextColor(a.theme.TextMuted)
-		}
-	})
+	ui.Text(c, "任务管理").FontSize(22).Bold()
+	if len(a.jobs) == 0 {
+		ui.Text(c, "当前没有运行中的任务。").TextColor(a.theme.TextMuted)
+	}
 	for _, task := range a.jobs {
 		panel(c).Key(task).Children(func() {
 			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, task.title).Grow(1).FontSize(16).Bold().TextColor(highlight)
-				if ui.Button(c, "取消").Label("取消 " + task.title).Disabled(task.cancelling).Clicked() {
+				cancel := ui.ButtonBase(c).Label("取消 "+task.title).Tooltip("取消任务").Disabled(task.cancelling).
+					Size(28, 28).Center().Radius(6)
+				if cancel.Hovered() && !task.cancelling {
+					cancel.Background(a.theme.SurfaceHover)
+				}
+				cancel.Children(func() { ui.Text(c, "×").FontSize(18).TextColor(highlight) })
+				if cancel.Clicked() {
 					task.requestCancel()
 				}
 			})
-			ui.Text(c, task.message).TextColor(a.theme.TextMuted)
-			progress, _ := taskProgress(task.message)
-			ui.Progress(c, progress).Label(task.title + "进度")
+			if len(task.stages) == 0 || task.cancelling {
+				ui.Text(c, task.message).TextColor(a.theme.TextMuted)
+				return
+			}
+			ui.Column(c).Gap(7).Children(func() {
+				for _, stage := range task.stages {
+					marker := "•••"
+					if stage.Fraction >= 0 {
+						percent := int(stage.Fraction * 100)
+						if stage.Remaining > 0 {
+							percent = min(percent, 99)
+						}
+						marker = fmt.Sprintf("%d%%", percent)
+					}
+					ui.Row(c).Key(stage.Label).Gap(12).AlignItems(ui.Center).Children(func() {
+						ui.Column(c).Width(48).Shrink(0).AlignItems(ui.Center).Children(func() {
+							ui.Text(c, marker).FontSize(13).TextColor(highlight)
+						})
+						ui.Text(c, stage.Label).Grow(1).FontSize(14)
+					})
+				}
+			})
 		})
 	}
 }

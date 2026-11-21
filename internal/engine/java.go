@@ -30,6 +30,10 @@ func (e Engine) javaHome(major int) string {
 	return filepath.Join(e.javaRoot(), fmt.Sprintf("zulu %d", major))
 }
 
+func (e Engine) temurinHome(major int) string {
+	return filepath.Join(e.javaRoot(), fmt.Sprintf("temurin %d", major))
+}
+
 func (e Engine) javaRoot() string {
 	if e.JavaRoot != "" {
 		return e.JavaRoot
@@ -60,16 +64,12 @@ func isJDK(home string, major int) bool {
 }
 
 func (e Engine) InstalledJava() []int {
-	entries, _ := os.ReadDir(e.javaRoot())
 	var versions []int
-	for _, entry := range entries {
-		major, found := strings.CutPrefix(strings.ToLower(entry.Name()), "zulu ")
-		n, err := strconv.Atoi(major)
-		if found && err == nil && slices.Contains(javaMajors, n) && isJDK(e.javaHome(n), n) {
-			versions = append(versions, n)
+	for _, major := range javaMajors {
+		if isJDK(e.temurinHome(major), major) || isJDK(e.javaHome(major), major) {
+			versions = append(versions, major)
 		}
 	}
-	slices.Sort(versions)
 	return versions
 }
 
@@ -79,7 +79,7 @@ func launcherJavaMajor(required int) (int, error) {
 			return major, nil
 		}
 	}
-	return 0, fmt.Errorf("无法满足 Java %d，启动器提供 Zulu JDK 8、17、21 和 25", required)
+	return 0, fmt.Errorf("无法满足 Java %d，启动器提供 JDK 8、17、21 和 25", required)
 }
 
 func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) (string, error) {
@@ -93,7 +93,7 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	if err := normalizeDirectoryCase(ctx, parent); err != nil {
 		return "", err
 	}
-	reuse := func() (string, error) {
+	reuse := func(target string) (string, error) {
 		if err := normalizeDirectoryCase(ctx, target); err != nil {
 			return "", err
 		}
@@ -102,8 +102,16 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 		}
 		return target, nil
 	}
-	if isJDK(target, major) {
-		return reuse()
+	installed := func() string {
+		for _, home := range []string{e.temurinHome(major), target} {
+			if isJDK(home, major) {
+				return home
+			}
+		}
+		return ""
+	}
+	if home := installed(); home != "" {
+		return reuse(home)
 	}
 	if err := os.MkdirAll(parent, 0700); err != nil {
 		return "", err
@@ -121,10 +129,10 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 			os.RemoveAll(stage)
 		}
 	}()
-	label := fmt.Sprintf("Zulu JDK %d", major)
+	label := fmt.Sprintf("JDK %d", major)
 	waiting := false
 	locked, err := waitFileLock(ctx, lock, func() bool {
-		if isJDK(target, major) {
+		if installed() != "" {
 			return true
 		}
 		if !waiting {
@@ -136,58 +144,37 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	if err != nil {
 		return "", err
 	}
-	if !locked || isJDK(target, major) {
+	if home := installed(); !locked || home != "" {
 		if waiting {
 			status("正在复用已安装的 " + label + "…")
 		}
-		return reuse()
+		return reuse(home)
 	}
 	status("正在查询 " + label + "…")
-	query := fmt.Sprintf("java_version=%d&os=windows&arch=x86&hw_bitness=64", major) +
-		"&archive_type=zip&java_package_type=jdk&javafx_bundled=false&crac_supported=false" +
-		"&release_status=ga&availability_types=CA&latest=true"
-	type azulPackage struct {
-		ID      string `json:"package_uuid"`
-		Name    string
-		Version []int `json:"java_version"`
-	}
-	var packages []azulPackage
-	if err := fetchJSON(ctx, azulAPI+"?"+query, &packages); err != nil {
-		return "", err
-	}
-	packages = slices.DeleteFunc(packages, func(p azulPackage) bool {
-		return len(p.Version) == 0 || p.Version[0] != major ||
-			!segment(p.Name) || !strings.HasSuffix(strings.ToLower(p.Name), "-win_x64.zip") || !packageID.MatchString(p.ID)
-	})
-	slices.SortFunc(packages, func(a, b azulPackage) int {
-		return slices.Compare(b.Version, a.Version)
-	})
-	if len(packages) == 0 {
-		return "", fmt.Errorf("Azul 暂未提供 Windows x64 的 %s", label)
-	}
-	var build struct {
-		URL  string `json:"download_url"`
-		Hash string `json:"sha256_hash"`
-	}
-	if err := fetchJSON(ctx, azulAPI+packages[0].ID, &build); err != nil {
-		return "", err
-	}
-	source, err := url.Parse(build.URL)
-	hash, hashErr := hex.DecodeString(build.Hash)
-	if err != nil || source.Scheme != "https" || source.Host != "cdn.azul.com" || hashErr != nil || len(hash) != 32 {
-		return "", fmt.Errorf("Azul 返回的 %s 下载地址或校验值无效", label)
-	}
-
 	stage, err = makeCacheStage(ctx, ".jdk-")
 	if err != nil {
 		return "", err
 	}
-	archive := filepath.Join(stage, strings.ToLower(packages[0].Name))
-	item := transfer{artifact{URL: build.URL, SHA256: build.Hash}, archive}
-	progress := &downloadProgress{label: label, status: status, start: time.Now()}
-	status("正在下载 " + label + "…")
-	if err := item.ensureWithProgress(ctx, progress.add); err != nil {
-		return "", err
+	name, item, temurinErr := temurinDownload(ctx, major)
+	archive := filepath.Join(stage, name)
+	if temurinErr == nil {
+		temurinErr = ensureAll(ctx, []transfer{{item, archive}}, "下载 Temurin "+label, status)
+	}
+	if temurinErr == nil {
+		target = e.temurinHome(major)
+	} else {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		status("Temurin 下载暂不可用，正在切换到 Azul Zulu…")
+		name, item, err = azulDownload(ctx, major)
+		if err != nil {
+			return "", errors.Join(temurinErr, err)
+		}
+		archive = filepath.Join(stage, name)
+		if err := ensureAll(ctx, []transfer{{item, archive}}, "下载 Zulu "+label, status); err != nil {
+			return "", errors.Join(temurinErr, err)
+		}
 	}
 	status("正在解压 " + label + "…")
 	unpacked := filepath.Join(stage, "extracted")
@@ -223,6 +210,77 @@ func (e Engine) EnsureJava(ctx context.Context, major int, status func(string)) 
 	}
 	status("已安装 " + label + "，正在清理临时文件…")
 	return target, nil
+}
+
+func temurinDownload(ctx context.Context, major int) (string, artifact, error) {
+	var builds []struct {
+		Binary struct {
+			Package struct {
+				Name, Link, Checksum string
+				Size                 int64
+			}
+		}
+	}
+	address := fmt.Sprintf("https://api.adoptium.net/v3/assets/latest/%d/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse", major)
+	metadataCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	if err := catalogJSON(metadataCtx, address, &builds); err != nil {
+		return "", artifact{}, err
+	}
+	for _, build := range builds {
+		p := build.Binary.Package
+		source, err := url.Parse(p.Link)
+		hash, hashErr := hex.DecodeString(p.Checksum)
+		prefix := fmt.Sprintf("OpenJDK%dU-jdk_x64_windows_hotspot_", major)
+		if err != nil || source.Scheme != "https" || source.Host != "github.com" || source.User != nil ||
+			!strings.HasPrefix(source.Path, fmt.Sprintf("/adoptium/temurin%d-binaries/releases/download/", major)) ||
+			!segment(p.Name) || !strings.HasPrefix(p.Name, prefix) || !strings.HasSuffix(p.Name, ".zip") ||
+			filepath.Base(source.Path) != p.Name || hashErr != nil || len(hash) != 32 || p.Size <= 0 {
+			continue
+		}
+		relative := fmt.Sprintf("/%d/jdk/x64/windows/%s", major, url.PathEscape(p.Name))
+		return p.Name, artifact{URL: p.Link, SHA256: p.Checksum, Size: p.Size, rangeParts: 8,
+			Mirrors: []string{"https://mirrors.nju.edu.cn/adoptium" + relative, "https://mirrors.lzu.edu.cn/adoptium" + relative}}, nil
+	}
+	return "", artifact{}, fmt.Errorf("Adoptium 未返回可校验的 Windows x64 JDK %d", major)
+}
+
+func azulDownload(ctx context.Context, major int) (string, artifact, error) {
+	query := fmt.Sprintf("java_version=%d&os=windows&arch=x86&hw_bitness=64", major) +
+		"&archive_type=zip&java_package_type=jdk&javafx_bundled=false&crac_supported=false" +
+		"&release_status=ga&availability_types=CA&latest=true"
+	type azulPackage struct {
+		ID      string `json:"package_uuid"`
+		Name    string
+		Version []int `json:"java_version"`
+	}
+	var packages []azulPackage
+	if err := fetchJSON(ctx, azulAPI+"?"+query, &packages); err != nil {
+		return "", artifact{}, err
+	}
+	packages = slices.DeleteFunc(packages, func(p azulPackage) bool {
+		return len(p.Version) == 0 || p.Version[0] != major ||
+			!segment(p.Name) || !strings.HasSuffix(strings.ToLower(p.Name), "-win_x64.zip") || !packageID.MatchString(p.ID)
+	})
+	slices.SortFunc(packages, func(a, b azulPackage) int {
+		return slices.Compare(b.Version, a.Version)
+	})
+	if len(packages) == 0 {
+		return "", artifact{}, fmt.Errorf("Azul 暂未提供 Windows x64 JDK %d", major)
+	}
+	var build struct {
+		URL  string `json:"download_url"`
+		Hash string `json:"sha256_hash"`
+	}
+	if err := fetchJSON(ctx, azulAPI+packages[0].ID, &build); err != nil {
+		return "", artifact{}, err
+	}
+	source, err := url.Parse(build.URL)
+	hash, hashErr := hex.DecodeString(build.Hash)
+	if err != nil || source.Scheme != "https" || source.Host != "cdn.azul.com" || hashErr != nil || len(hash) != 32 {
+		return "", artifact{}, fmt.Errorf("Azul 返回的 JDK %d 下载地址或校验值无效", major)
+	}
+	return strings.ToLower(packages[0].Name), artifact{URL: build.URL, SHA256: build.Hash, rangeParts: 8}, nil
 }
 
 func normalizeDirectoryCase(ctx context.Context, target string) error {

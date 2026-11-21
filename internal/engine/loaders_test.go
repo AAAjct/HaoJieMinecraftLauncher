@@ -1,8 +1,12 @@
 package engine
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha1"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,7 +14,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestForgeBuildsMatchMinecraftVersion(t *testing.T) {
@@ -75,7 +82,7 @@ func TestNeoForgeInstallerFallsBackToForgeCDN(t *testing.T) {
 		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
 	})
 	target := filepath.Join(t.TempDir(), "installer.jar")
-	if err := downloadForgeInstaller(t.Context(), "https://maven.neoforged.net/releases"+path, target); err != nil {
+	if err := downloadForgeInstaller(t.Context(), "https://maven.neoforged.net/releases"+path, target, "下载 NeoForge 安装器", func(string) {}); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(target); err != nil || string(got) != jar {
@@ -113,7 +120,11 @@ func TestForgeFamilyCachesInstallersUnderLibraries(t *testing.T) {
 	} {
 		t.Run(test.instance.Loader+"-"+test.instance.Version, func(t *testing.T) {
 			e := Engine{GameRoot: t.TempDir()}
-			if _, err := e.installForgeFamily(t.Context(), test.instance, gameProfile{}, func(string) {}); err == nil {
+			installer, err := e.downloadForgeFamilyInstaller(e.resumableDownloads(t.Context()), test.instance, test.instance.Loader, func(string) {})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.installForgeFamily(t.Context(), test.instance, gameProfile{}, test.instance.Loader, installer, "", func(string) {}); err == nil {
 				t.Fatal("non-ZIP fixture was accepted as an installer")
 			}
 			target := filepath.Join(e.GameRoot, "libraries", filepath.FromSlash(test.path))
@@ -124,6 +135,109 @@ func TestForgeFamilyCachesInstallersUnderLibraries(t *testing.T) {
 				t.Fatalf("unexpected loader directory in game root: %v", err)
 			}
 		})
+	}
+}
+
+func TestNeoForgeDownloadsClientInstallerAndJDKConcurrently(t *testing.T) {
+	const clientJar, installerJar = "Minecraft fixture", "invalid NeoForge ZIP"
+	const packageID = "00000000-0000-0000-0000-000000000021"
+	const jdkFile = "zulu21-win_x64.zip"
+	const jdkURL = "https://cdn.azul.com/" + jdkFile
+	var archive bytes.Buffer
+	z := zip.NewWriter(&archive)
+	for path, contents := range map[string]string{
+		"zulu/bin/java.exe": "java", "zulu/bin/javac.exe": "javac", "zulu/release": "JAVA_VERSION=21.0.1",
+	} {
+		entry, err := z.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(entry, contents); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := z.Close(); err != nil {
+		t.Fatal(err)
+	}
+	begun := make(chan struct{})
+	var downloads atomic.Int32
+	previous := client.Transport
+	t.Cleanup(func() { client.Transport = previous })
+	client.Transport = curseTestTransport(func(req *http.Request) (*http.Response, error) {
+		var body string
+		var download bool
+		switch {
+		case req.URL.Path == "/version/1.21.1/client":
+			body, download = clientJar, true
+		case strings.HasSuffix(req.URL.Path, "-installer.jar.sha1"):
+			body = fmt.Sprintf("%x", sha1.Sum([]byte(installerJar)))
+		case strings.HasSuffix(req.URL.Path, "-installer.jar"):
+			body, download = installerJar, true
+		case req.URL.Query().Get("java_version") == "21":
+			body = fmt.Sprintf(`[{"package_uuid":%q,"name":%q,"java_version":[21,0,1]}]`, packageID, jdkFile)
+		case req.URL.String() == azulAPI+packageID:
+			body = fmt.Sprintf(`{"download_url":%q,"sha256_hash":"%x"}`, jdkURL, sha256.Sum256(archive.Bytes()))
+		case req.URL.String() == jdkURL:
+			body, download = archive.String(), true
+		default:
+			return nil, fmt.Errorf("unexpected request %s", req.URL)
+		}
+		if download {
+			if downloads.Add(1) == 3 {
+				close(begun)
+			}
+			select {
+			case <-begun:
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+		}
+		return &http.Response{StatusCode: http.StatusOK, ContentLength: int64(len(body)), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	e := Engine{DataDir: t.TempDir(), GameRoot: t.TempDir()}
+	i := Instance{Version: "1.21.1", Loader: "neoforge", Build: "21.1.264"}
+	profile := gameProfile{ID: i.Version, MainClass: "Main"}
+	profile.JavaVersion.MajorVersion = 21
+	profile.Downloads.Client = artifact{URL: "https://piston-data.mojang.com/client.jar", Size: int64(len(clientJar)), SHA1: fmt.Sprintf("%x", sha1.Sum([]byte(clientJar)))}
+	if err := os.MkdirAll(e.versionCacheDir(i.Version), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSON(e.baseVersionFile(i.Version, ".json"), profile); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	var progressMu sync.Mutex
+	var planned []string
+	ctx = WithStageProgress(ctx, func(updates []StageProgress) {
+		progressMu.Lock()
+		defer progressMu.Unlock()
+		if planned == nil {
+			for _, update := range updates {
+				planned = append(planned, update.Label)
+				if update.Fraction >= 0 {
+					t.Errorf("initial stage is already active: %+v", update)
+				}
+			}
+			return
+		}
+		for _, update := range updates {
+			if !slices.Contains(planned, update.Label) {
+				t.Errorf("unplanned stage appeared during download: %s", update.Label)
+			}
+		}
+	})
+	_, err := e.Install(ctx, i, func(string) {})
+	if !errors.Is(err, zip.ErrFormat) || downloads.Load() != 3 || !isJDK(e.javaHome(21), 21) || !regularFile(e.baseVersionFile(i.Version, ".jar")) {
+		t.Fatalf("expected all three downloads before installer validation, got %d requests and %v", downloads.Load(), err)
+	}
+	want := []string{
+		"读取原版版本信息", "下载 Minecraft 客户端", "下载并安装 JDK", "下载 NeoForge 安装器",
+		"分析加载器运行库", "下载 NeoForge 运行库", "安装 NeoForge", "下载游戏运行库",
+		"下载 Minecraft 资源索引", "下载 Minecraft 资源", "安装游戏实例",
+	}
+	if !slices.Equal(planned, want) {
+		t.Fatalf("initial install stages = %v, want %v", planned, want)
 	}
 }
 

@@ -18,8 +18,8 @@ import (
 
 func TestParallelRangeAndFallback(t *testing.T) {
 	content := bytes.Repeat([]byte("hjml download content"), (minimumSegmentedSize/21)+4)
-	for _, ranges := range []bool{true, false} {
-		t.Run(fmt.Sprint(ranges), func(t *testing.T) {
+	for _, parts := range []int{4, 8, 0} {
+		t.Run(fmt.Sprint(parts), func(t *testing.T) {
 			var segments atomic.Int32
 			var active atomic.Int32
 			var maximum atomic.Int32
@@ -28,8 +28,8 @@ func TestParallelRangeAndFallback(t *testing.T) {
 				w.Header().Set("ETag", `"stable"`)
 				if r.Header.Get("Range") != "" {
 					segments.Add(1)
-					if !ranges {
-						w.WriteHeader(http.StatusBadRequest)
+					if parts == 0 {
+						w.WriteHeader(http.StatusForbidden)
 						return
 					}
 					n := active.Add(1)
@@ -42,7 +42,7 @@ func TestParallelRangeAndFallback(t *testing.T) {
 			}))
 			defer server.Close()
 			target := filepath.Join(t.TempDir(), "large.bin")
-			work := transfer{artifact{URL: server.URL, SHA256: fmt.Sprintf("%x", sha256.Sum256(content)), Size: int64(len(content))}, target}
+			work := transfer{artifact{URL: server.URL, SHA256: fmt.Sprintf("%x", sha256.Sum256(content)), Size: int64(len(content)), rangeParts: parts}, target}
 			cache := Engine{DataDir: t.TempDir()}
 			if err := work.ensure(cache.resumableDownloads(t.Context())); err != nil {
 				t.Fatal(err)
@@ -50,7 +50,7 @@ func TestParallelRangeAndFallback(t *testing.T) {
 			if data, err := os.ReadFile(target); err != nil || !bytes.Equal(data, content) {
 				t.Fatalf("output mismatch: %v", err)
 			}
-			if segments.Load() == 0 || (ranges && (segments.Load() != 4 || maximum.Load() < 2)) {
+			if segments.Load() == 0 || (parts > 0 && (segments.Load() != int32(parts) || maximum.Load() < 2)) {
 				t.Fatalf("ranges: %d, simultaneous: %d", segments.Load(), maximum.Load())
 			}
 		})
@@ -108,7 +108,7 @@ func TestResumeAcrossDownloadAttempts(t *testing.T) {
 			if err != nil || lock == nil {
 				t.Fatalf("could not reserve test download cache: %v", err)
 			}
-			err = first.copyResumable(ctx, cache, func(n, _ int64) {
+			err = first.copyResumable(ctx, cache, 0, func(n, _ int64) {
 				if received.Add(n) >= parts*block {
 					cancel()
 				}
@@ -158,7 +158,7 @@ func TestCancelTaskRemovesPartialDownload(t *testing.T) {
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("download temporary files remain: %v (%v)", entries, err)
 	}
-	entries, err = os.ReadDir(filepath.Join(e.DataDir, ".hjm-cache", "temp"))
+	entries, err = os.ReadDir(filepath.Join(e.DataDir, ".hjml-cache", "temp"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestFailedDownloadRemovesPartialCache(t *testing.T) {
 	if err := file.ensure(e.resumableDownloads(t.Context())); err == nil || regularFile(target) {
 		t.Fatalf("incomplete download was published: %v", err)
 	}
-	entries, err := os.ReadDir(filepath.Join(e.GameRoot, ".hjm-cache", "temp"))
+	entries, err := os.ReadDir(filepath.Join(e.GameRoot, ".hjml-cache", "temp"))
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("cache after failed download: %v (%v)", entries, err)
 	}
@@ -248,5 +248,54 @@ func TestDownloadsPreferMirrorAndFallBackAfterHashMismatch(t *testing.T) {
 	}
 	if mirrorRequests.Load() != 2 || officialRequests.Load() != 1 {
 		t.Fatalf("mirror=%d official=%d, expected two mirror requests and one fallback", mirrorRequests.Load(), officialRequests.Load())
+	}
+}
+
+func TestDownloadsReportEverySourceAndSkipPermanentFailures(t *testing.T) {
+	var missing, unavailable atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/missing" {
+			missing.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		unavailable.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	item := transfer{artifact{URL: server.URL + "/online", Mirrors: []string{server.URL + "/missing"}}, filepath.Join(t.TempDir(), "mod.jar")}
+	err := item.ensure(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") || !strings.Contains(err.Error(), "HTTP 503") ||
+		missing.Load() != 1 || unavailable.Load() != 3 {
+		t.Fatalf("expected one permanent attempt and three transient attempts, got %d, %d, %v", missing.Load(), unavailable.Load(), err)
+	}
+}
+
+func TestMigrateDownloadCachePreservesExistingVersionCache(t *testing.T) {
+	e := Engine{GameRoot: t.TempDir()}
+	old := filepath.Join(e.GameRoot, ".hjm-cache")
+	temp := filepath.Join(old, "temp")
+	version := e.versionCacheDir("1.21.1")
+	for _, dir := range []string{temp, version} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "fixture"), []byte(dir), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 2 {
+		if err := e.MigrateDownloadCache(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newTemp := downloadTempDir(e.resumableDownloads(t.Context()))
+	for _, dir := range []string{newTemp, version} {
+		if !regularFile(filepath.Join(dir, "fixture")) {
+			t.Fatalf("fixture missing from %s", dir)
+		}
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old cache still exists: %v", err)
 	}
 }

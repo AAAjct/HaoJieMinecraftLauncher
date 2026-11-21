@@ -213,7 +213,30 @@ func (e Engine) Install(ctx context.Context, instance Instance, status func(stri
 	return e.createInstance(ctx, instance, "", nil, status)
 }
 
-func (e Engine) createInstance(ctx context.Context, instance Instance, archive string, setupPack func(string) error, status func(string)) (_ Instance, installErr error) {
+const (
+	resolveBuildStage    = "选择加载器版本"
+	installInstanceStage = "安装游戏实例"
+	fabricAPIStage       = "下载 Fabric API"
+)
+
+func (e Engine) createInstance(ctx context.Context, instance Instance, archive string, setupPack func(context.Context, string, func(string)) error, status func(string)) (_ Instance, installErr error) {
+	var stages []string
+	if instance.Loader != "" && instance.Build == "" {
+		stages = append(stages, resolveBuildStage)
+	}
+	stages = append(stages, versionInfoStage, clientStage, javaStage)
+	stages = append(stages, loaderStages(instance.Loader)...)
+	stages = append(stages, librariesStage, assetIndexStage, assetsStage)
+	if setupPack != nil {
+		stages = append(stages, packResourcesStage, packOverridesStage)
+	}
+	if instance.Loader == "fabric" {
+		stages = append(stages, fabricAPIStage)
+	}
+	planStages(ctx, append(stages, installInstanceStage)...)
+	if setupPack != nil {
+		reportStage(ctx, StageProgress{Label: packManifestStage, Fraction: 1})
+	}
 	lock := e.versionLock(instance)
 	lock.RLock()
 	defer func() {
@@ -228,11 +251,13 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, archive s
 	}()
 	ctx = e.resumableDownloads(ctx)
 	if instance.Loader != "" && instance.Build == "" {
-		build, err := nextLoader(ctx, instance.Version, instance.Loader)
-		if err != nil {
+		if err := trackStage(ctx, resolveBuildStage, func(ctx context.Context) error {
+			var err error
+			instance.Build, err = nextLoader(ctx, instance.Version, instance.Loader)
+			return err
+		}); err != nil {
 			return Instance{}, err
 		}
-		instance.Build = build
 	}
 	instance.Name = strings.TrimSpace(instance.Name)
 	if instance.Name == "" {
@@ -281,25 +306,30 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, archive s
 	if err := os.MkdirAll(game, 0700); err != nil {
 		return Instance{}, err
 	}
-	profile, err := e.installGame(ctx, instance, status)
-	if err != nil {
+	var profile gameProfile
+	install := func(ctx context.Context, status func(string)) error {
+		var err error
+		profile, err = e.installGame(ctx, instance, status)
+		return err
+	}
+	if setupPack != nil {
+		if err := runParallel(ctx, status, install, func(ctx context.Context, status func(string)) error {
+			return setupPack(ctx, game, status)
+		}); err != nil {
+			return Instance{}, err
+		}
+	} else if err := install(ctx, status); err != nil {
 		return Instance{}, err
 	}
 	instance.Java = profile.JavaVersion.MajorVersion
-	if _, err := e.EnsureJava(ctx, instance.Java, status); err != nil {
-		return Instance{}, err
-	}
-	if setupPack != nil {
-		if err := setupPack(game); err != nil {
-			return Instance{}, err
-		}
-	}
 	indexPath := filepath.Join(e.gameRoot(), "assets", "indexes", profile.AssetIndex.ID+".json")
 	if err := defaultChinese(game, indexPath); err != nil {
 		return Instance{}, err
 	}
 	if instance.Loader == "fabric" {
-		if err := installFabricAPI(ctx, instance, game, status); err != nil {
+		if err := trackStage(ctx, fabricAPIStage, func(ctx context.Context) error {
+			return installFabricAPI(ctx, instance, game, status)
+		}); err != nil {
 			return Instance{}, err
 		}
 	}
@@ -348,6 +378,7 @@ func (e Engine) createInstance(ctx context.Context, instance Instance, archive s
 	if err != nil {
 		return Instance{}, err
 	}
+	reportStage(ctx, StageProgress{Label: installInstanceStage, Fraction: 1})
 	return instance, nil
 }
 

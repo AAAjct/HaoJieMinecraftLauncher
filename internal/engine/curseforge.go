@@ -28,6 +28,43 @@ func curseForgeCDN(host string) bool {
 	return host == "edge.forgecdn.net" || host == "mediafilez.forgecdn.net"
 }
 
+func validCurseDownload(address string) bool {
+	u, err := url.Parse(address)
+	return err == nil && u.Scheme == "https" && u.User == nil && curseForgeCDN(u.Host)
+}
+
+func curseCDNFileURL(id int, filename string) string {
+	if id <= 0 || !segment(filename) {
+		return ""
+	}
+	address := url.URL{
+		Scheme: "https", Host: "mediafilez.forgecdn.net",
+		Path: fmt.Sprintf("/files/%d/%d/%s", id/1000, id%1000, filename),
+	}
+	return address.String()
+}
+
+func curseDownloadURL(ctx context.Context, project, file int) (string, error) {
+	path := fmt.Sprintf("mods/%d/files/%d/download-url", project, file)
+	source := func(base string) catalogSource[string] {
+		return func(ctx context.Context) (string, error) {
+			var response curseResponse[string]
+			if err := catalogRequest(ctx, http.MethodGet, base+path, nil, &response); err != nil {
+				return "", err
+			}
+			if !validCurseDownload(response.Data) {
+				return "", fmt.Errorf("CurseForge API 未提供可用的第三方下载地址")
+			}
+			return response.Data, nil
+		}
+	}
+	sources := []catalogSource[string]{source(mcim + "/curseforge/v1/")}
+	if curseForgeKey() != "" {
+		sources = append(sources, source("https://api.curseforge.com/v1/"))
+	}
+	return preferCatalog(ctx, sources...)
+}
+
 type cursePagination struct{ TotalCount int }
 
 type curseResponse[T any] struct {

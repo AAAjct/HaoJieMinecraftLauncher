@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +33,8 @@ type artifact struct {
 	SHA256              string   `json:"sha256,omitempty"`
 	SHA512              string   `json:"sha512,omitempty"`
 	Mirrors, Alternates []string `json:"-"`
+	localSource         string
+	rangeParts          int
 }
 
 type transfer struct {
@@ -82,6 +86,19 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 	if err := os.MkdirAll(filepath.Dir(t.target), 0700); err != nil {
 		return err
 	}
+	if t.localSource != "" {
+		input, err := os.Open(t.localSource)
+		if err == nil {
+			defer input.Close()
+			err = t.saveTransfer(ctx, func(out *os.File, digest hash.Hash, limit int64) (int64, error) {
+				return io.Copy(io.MultiWriter(out, digest), io.LimitReader(cancellableReader{ctx, input}, limit+1))
+			})
+		}
+		if err != nil {
+			return fmt.Errorf("整合包旁的 %s 校验或复制失败：%w", filepath.Base(t.localSource), err)
+		}
+		return nil
+	}
 	cache, lock, err := t.lockResumeCache(ctx)
 	if err != nil {
 		return err
@@ -97,26 +114,50 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			return nil
 		}
 	}
-	sources := t.orderedSources()
+	sources := slices.Compact(t.orderedSources())
+	failures := make([]error, len(sources))
+	permanent := make([]bool, len(sources))
 	for attempt := range 3 {
-		for _, source := range sources {
+		retry := false
+		for i, source := range sources {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
+			if permanent[i] {
+				continue
+			}
 			t.URL = source
-			downloadCtx, cancel := ctx, func() {}
-			if source != sources[len(sources)-1] && t.Size > 0 && t.Size <= 1<<20 {
-				downloadCtx, cancel = context.WithTimeout(ctx, 8*time.Second)
-			}
 			if cache != "" {
-				err = t.copyResumable(downloadCtx, cache, progress)
+				workers := t.rangeParts
+				if workers > 4 && attempt > 0 {
+					workers = 4
+					if attempt == 2 {
+						workers = 1
+					}
+				}
+				err = t.copyResumable(ctx, cache, workers, progress)
 			} else {
-				err = t.copyWithProgress(downloadCtx, progress)
+				err = t.copyWithProgress(ctx, progress)
 			}
-			cancel()
 			if err == nil {
 				return nil
 			}
+			var failure httpFailure
+			if errors.As(err, &failure) {
+				permanent[i] = failure.status == http.StatusNotFound || failure.status == http.StatusGone ||
+					failure.status == http.StatusForbidden || failure.status == http.StatusUnauthorized
+			} else if u, parseErr := url.Parse(source); parseErr == nil && u.Host != "" {
+				var requestError *url.Error
+				if errors.As(err, &requestError) {
+					err = requestError.Err
+				}
+				err = fmt.Errorf("%s：%w", u.Host, err)
+			}
+			failures[i] = err
+			retry = retry || !permanent[i]
+		}
+		if !retry {
+			break
 		}
 		if attempt < 2 {
 			timer := time.NewTimer(time.Duration(attempt+1) * 300 * time.Millisecond)
@@ -128,7 +169,7 @@ func (t transfer) ensureWithProgress(ctx context.Context, progress func(int64, i
 			}
 		}
 	}
-	return fmt.Errorf("%s：%w", filepath.Base(t.target), err)
+	return fmt.Errorf("%s：%w", filepath.Base(t.target), errors.Join(failures...))
 }
 
 func (t transfer) copy(ctx context.Context) error {
@@ -136,7 +177,7 @@ func (t transfer) copy(ctx context.Context) error {
 }
 
 func (t transfer) copyWithProgress(ctx context.Context, progress func(int64, int64)) error {
-	res, err := get(ctx, t.URL)
+	res, err := getTransfer(ctx, t.URL, "")
 	if err != nil {
 		return err
 	}
@@ -256,6 +297,16 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 	emit := func() {
 		now := time.Now()
 		rate := float64(received-lastBytes) / (1 << 20) / max(now.Sub(last).Seconds(), 0.1)
+		fraction := 1.0
+		if done < total {
+			fraction = float64(done) / float64(total)
+			if knownSize && totalSize > 0 {
+				fraction = float64(downloaded) / float64(totalSize)
+			}
+		} else {
+			rate = 0
+		}
+		reportStage(ctx, StageProgress{Label: label, Fraction: fraction, Remaining: total - done, BytesPerSecond: rate * (1 << 20)})
 		message := fmt.Sprintf("%s · %d/%d 文件", label, done, total)
 		if knownSize && totalSize > 0 {
 			message += fmt.Sprintf(" · %.1f%%（%.2f/%.2f MiB）", 100*float64(downloaded)/float64(totalSize), float64(downloaded)/(1<<20), float64(totalSize)/(1<<20))
@@ -266,6 +317,9 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 		last, lastBytes = now, received
 	}
 	emit()
+	if len(pending) == 0 {
+		return ctx.Err()
+	}
 	for range min(32, len(pending)) {
 		wg.Go(func() {
 			for ctx.Err() == nil {
@@ -275,15 +329,19 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 				}
 				item := pending[index]
 				var credited int64
-				err := item.ensureWithProgress(ctx, func(n, _ int64) {
+				size := item.Size
+				err := item.ensureWithProgress(ctx, func(n, responseSize int64) {
 					mu.Lock()
+					if total == 1 && size <= 0 && responseSize > 0 {
+						size, totalSize, knownSize = responseSize, responseSize, true
+					}
 					firstBytes := n > 0 && received == 0
 					before := credited
 					if n < 0 {
 						credited = 0
 					} else {
 						received += n
-						credited = min(item.Size, credited+n)
+						credited = min(size, credited+n)
 					}
 					downloaded += credited - before
 					if firstBytes || time.Since(last) >= 250*time.Millisecond {
@@ -294,7 +352,7 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 				mu.Lock()
 				if err == nil {
 					done++
-					downloaded += item.Size - credited
+					downloaded += size - credited
 				} else if first == nil {
 					first = err
 					cancel()
@@ -306,11 +364,28 @@ func ensureAll(ctx context.Context, work []transfer, label string, status func(s
 			}
 		})
 	}
-	wg.Wait()
-	if first != nil {
-		return first
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-finished:
+			if first != nil {
+				return first
+			}
+			return ctx.Err()
+		case <-ticker.C:
+			mu.Lock()
+			if done < total && time.Since(last) >= time.Second {
+				emit()
+			}
+			mu.Unlock()
+		}
 	}
-	return ctx.Err()
 }
 
 func writeJSON(path string, value any) error {

@@ -40,6 +40,7 @@ type app struct {
 	modFilter     string
 	renameValue   string
 	running       map[*engine.Game]string
+	crashes       []crashNotice
 	stopLaunch    bool
 	skinAvatar    ui.ImageSource
 	alexLoading   bool
@@ -99,6 +100,7 @@ type job struct {
 	key, title string
 	target     string
 	message    string
+	stages     []engine.StageProgress
 	cancel     context.CancelFunc
 	onDone     func(error)
 	cancelling bool
@@ -313,6 +315,23 @@ func (a *app) startJob(task *job, work operation) {
 	a.jobs = append(a.jobs, task)
 	go func() {
 		defer cancel(nil)
+		ctx := engine.WithStageProgress(ctx, func(updates []engine.StageProgress) {
+			a.window.Update(func() {
+				if task.cancelling || !slices.Contains(a.jobs, task) {
+					return
+				}
+				for _, progress := range updates {
+					index := slices.IndexFunc(task.stages, func(stage engine.StageProgress) bool {
+						return stage.Label == progress.Label
+					})
+					if index < 0 {
+						task.stages = append(task.stages, progress)
+					} else {
+						task.stages[index] = progress
+					}
+				}
+			})
+		})
 		finish, err := work(ctx, func(s string) {
 			a.window.Update(func() {
 				if !task.cancelling && slices.Contains(a.jobs, task) {
@@ -418,19 +437,32 @@ func (a *app) play(i engine.Instance) {
 			go func() {
 				err := <-game.Done
 				a.window.Update(func() {
-					delete(a.running, game)
-					if !a.busy(launchJob) {
-						a.status = "游戏已退出 · " + i.Name
-						if game.Stopping {
-							a.status = "已结束 Minecraft · " + i.Name
-						} else if err != nil {
-							a.status = "游戏异常退出，请在游戏目录查看 " + filepath.Base(game.LogPath) + "。"
-						}
-					}
+					a.gameExited(i.Name, game, err)
 				})
 			}()
 		}, err
 	})
+}
+
+func (a *app) gameExited(name string, game *engine.Game, err error) {
+	delete(a.running, game)
+	if !a.closing && !game.Stopping && game.Crash != nil {
+		a.crashes = append(a.crashes, crashNotice{instance: name, report: game.Crash})
+		if a.window != nil && len(a.crashes) == 1 {
+			if a.window.IsMinimized() {
+				a.window.Restore()
+			}
+			a.window.Focus()
+		}
+	}
+	if !a.busy(launchJob) {
+		a.status = "游戏已退出 · " + name
+		if game.Stopping {
+			a.status = "已结束 Minecraft · " + name
+		} else if game.Crash != nil || err != nil {
+			a.status = "游戏异常退出 · " + name
+		}
+	}
 }
 
 func (a *app) stopGames() {
@@ -781,6 +813,8 @@ func main() {
 	}
 	if err := os.MkdirAll(gameRoot, 0700); err != nil {
 		a.status = "无法创建 .minecraft：" + err.Error()
+	} else if err := a.engine.MigrateDownloadCache(); err != nil {
+		a.status = "迁移下载缓存失败：" + err.Error()
 	}
 	mygo.App.WhenReady(func() {
 		a.window = mygo.NewWindow(mygo.WindowOptions{

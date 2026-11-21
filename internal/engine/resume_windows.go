@@ -21,11 +21,52 @@ const minimumResumableSize = 1 << 20
 
 type downloadCacheKey struct{}
 
+func (e Engine) cacheDir() string {
+	return filepath.Join(e.gameRoot(), ".hjml-cache")
+}
+
+func (e Engine) MigrateDownloadCache() error {
+	old := filepath.Join(e.gameRoot(), ".hjm-cache")
+	entries, err := os.ReadDir(old)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	root := e.cacheDir()
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return err
+	}
+	var preserved string
+	for _, entry := range entries {
+		target := filepath.Join(root, entry.Name())
+		if _, err := os.Lstat(target); err == nil {
+			if preserved == "" {
+				preserved, err = os.MkdirTemp(root, ".legacy-")
+				if err != nil {
+					return err
+				}
+			}
+			target = filepath.Join(preserved, entry.Name())
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Rename(filepath.Join(old, entry.Name()), target); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(old); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func (e Engine) resumableDownloads(ctx context.Context) context.Context {
 	if ctx.Value(downloadCacheKey{}) != nil {
 		return ctx
 	}
-	return context.WithValue(ctx, downloadCacheKey{}, filepath.Join(e.gameRoot(), ".hjm-cache", "temp"))
+	return context.WithValue(ctx, downloadCacheKey{}, filepath.Join(e.cacheDir(), "temp"))
 }
 
 func downloadTempDir(ctx context.Context) string {
@@ -105,14 +146,14 @@ var (
 	errResumeState = errors.New("断点文件与预期大小不符")
 )
 
-func (t transfer) copyResumable(ctx context.Context, dir string, progress func(int64, int64)) error {
+func (t transfer) copyResumable(ctx context.Context, dir string, workers int, progress func(int64, int64)) error {
 	meta := filepath.Join(dir, "download.json")
 	var plan resumePlan
 	var initial *http.Response
 	if readJSON(meta, &plan) != nil || plan.Size < minimumResumableSize || plan.Size > t.sizeLimit() ||
-		(t.Size > 0 && plan.Size != t.Size) || (plan.Parts != 1 && plan.Parts != 4) {
+		(t.Size > 0 && plan.Size != t.Size) || (plan.Parts != 1 && plan.Parts != 4 && plan.Parts != 8) {
 		var err error
-		initial, err = get(ctx, t.URL)
+		initial, err = getTransfer(ctx, t.URL, "")
 		if err != nil {
 			return err
 		}
@@ -136,18 +177,27 @@ func (t transfer) copyResumable(ctx context.Context, dir string, progress func(i
 			return err
 		}
 		plan = resumePlan{Size: size, Parts: 1}
-		if size >= minimumSegmentedSize && strings.EqualFold(initial.Header.Get("Accept-Ranges"), "bytes") {
-			plan.Parts = 4
+		if workers != 1 && size >= minimumSegmentedSize && strings.EqualFold(initial.Header.Get("Accept-Ranges"), "bytes") {
+			plan.Parts = max(4, t.rangeParts)
 		}
 		if err := writeJSON(meta, plan); err != nil {
 			return err
 		}
 	}
-	if plan.Parts == 4 {
+	if workers == 1 && plan.Parts > 1 {
+		plan.Parts = 1
+		if err := writeJSON(meta, plan); err != nil {
+			return err
+		}
+		if progress != nil {
+			progress(-1, plan.Size)
+		}
+	}
+	if plan.Parts > 1 {
 		if initial != nil {
 			initial.Body.Close()
 		}
-		err := t.resumeRanges(ctx, dir, plan, progress)
+		err := t.resumeRanges(ctx, dir, plan, workers, progress)
 		if errors.Is(err, errResumeRange) {
 			plan.Parts = 1
 			if err := writeJSON(meta, plan); err != nil {
@@ -202,16 +252,26 @@ func (t transfer) copyResumable(ctx context.Context, dir string, progress func(i
 	return err
 }
 
-func (t transfer) resumeRanges(ctx context.Context, dir string, plan resumePlan, progress func(int64, int64)) error {
+func (t transfer) resumeRanges(ctx context.Context, dir string, plan resumePlan, workers int, progress func(int64, int64)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
 	var once sync.Once
 	var first error
+	if workers <= 0 {
+		workers = plan.Parts
+	}
+	active := make(chan struct{}, workers)
 	for part := range plan.Parts {
 		start := plan.Size * int64(part) / int64(plan.Parts)
 		end := plan.Size * int64(part+1) / int64(plan.Parts)
 		wg.Go(func() {
+			select {
+			case active <- struct{}{}:
+				defer func() { <-active }()
+			case <-ctx.Done():
+				return
+			}
 			err := t.resumePart(ctx, filepath.Join(dir, fmt.Sprint(part)), plan.Size, start, end, nil, progress)
 			if err != nil {
 				once.Do(func() { first = err; cancel() })
@@ -219,7 +279,10 @@ func (t transfer) resumeRanges(ctx context.Context, dir string, plan resumePlan,
 		})
 	}
 	wg.Wait()
-	return first
+	if first != nil {
+		return first
+	}
+	return ctx.Err()
 }
 
 func (t transfer) resumePart(ctx context.Context, path string, total, start, end int64, initial *http.Response, progress func(int64, int64)) error {
@@ -243,15 +306,15 @@ func (t transfer) resumePart(ctx context.Context, path string, total, start, end
 	res := initial
 	if partial || existing > 0 {
 		rangeHeader := fmt.Sprintf("bytes=%d-%d", start+existing, end-1)
-		res, err = getHTTP(ctx, t.URL, rangeHeader)
-		if failure, ok := err.(httpFailure); ok && (failure.status == http.StatusBadRequest || failure.status == http.StatusRequestedRangeNotSatisfiable) {
+		res, err = getTransfer(ctx, t.URL, rangeHeader)
+		if failure, ok := err.(httpFailure); ok && rangeRejected(failure.status) {
 			if partial {
 				return errResumeRange
 			}
-			res, err = get(ctx, t.URL)
+			res, err = getTransfer(ctx, t.URL, "")
 		}
 	} else if res == nil {
-		res, err = get(ctx, t.URL)
+		res, err = getTransfer(ctx, t.URL, "")
 	}
 	if err != nil {
 		return err
@@ -264,7 +327,7 @@ func (t transfer) resumePart(ctx context.Context, path string, total, start, end
 				return errResumeRange
 			}
 			res.Body.Close()
-			full, err := get(ctx, t.URL)
+			full, err := getTransfer(ctx, t.URL, "")
 			if err != nil {
 				return err
 			}
@@ -297,4 +360,13 @@ func (t transfer) resumePart(ctx context.Context, path string, total, start, end
 	}
 	_, err = io.CopyN(out, res.Body, end-start-existing)
 	return err
+}
+
+func rangeRejected(status int) bool {
+	switch status {
+	case http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusMethodNotAllowed,
+		http.StatusRequestedRangeNotSatisfiable, http.StatusNotImplemented:
+		return true
+	}
+	return false
 }

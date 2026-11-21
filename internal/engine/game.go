@@ -237,37 +237,122 @@ func nextLoader(ctx context.Context, version, loader string) (string, error) {
 	return "", fmt.Errorf("%s 尚未支持 Minecraft %s", loader, version)
 }
 
-func (e Engine) profile(ctx context.Context, instance Instance, status func(string)) (gameProfile, error) {
-	base, err := e.baseProfile(ctx, instance.Version)
-	if err != nil || instance.Loader == "" {
-		return base, err
+const (
+	versionInfoStage = "读取原版版本信息"
+	clientStage      = "下载 Minecraft 客户端"
+	javaStage        = "下载并安装 JDK"
+	assetIndexStage  = "下载 Minecraft 资源索引"
+	assetsStage      = "下载 Minecraft 资源"
+	librariesStage   = "下载游戏运行库"
+)
+
+func forgeFamilyName(loader string) string {
+	switch loader {
+	case "forge":
+		return "Forge"
+	case "neoforge":
+		return "NeoForge"
+	}
+	return ""
+}
+
+func loaderStages(loader string) []string {
+	if name := forgeFamilyName(loader); name != "" {
+		return []string{"下载 " + name + " 安装器", "分析加载器运行库", "下载 " + name + " 运行库", "安装 " + name}
+	}
+	if loader != "" {
+		return []string{"读取 " + loader + " 加载器信息"}
+	}
+	return nil
+}
+
+func (e Engine) prepareGame(ctx context.Context, instance Instance, minimumJava int, status func(string)) (gameProfile, string, error) {
+	status("正在读取版本信息…")
+	var base gameProfile
+	if err := trackStage(ctx, versionInfoStage, func(ctx context.Context) error {
+		var err error
+		base, err = e.baseProfile(ctx, instance.Version)
+		return err
+	}); err != nil {
+		return base, "", err
 	}
 	source := loaderURL(instance.Loader)
-	usesInstaller := instance.Loader == "forge" || instance.Loader == "neoforge"
-	if (source == "" && !usesInstaller) || !segment(instance.Build) {
-		return base, fmt.Errorf("无效或不受支持的加载器")
+	name := forgeFamilyName(instance.Loader)
+	usesInstaller := name != ""
+	if instance.Loader != "" && ((source == "" && !usesInstaller) || !segment(instance.Build)) {
+		return base, "", fmt.Errorf("无效或不受支持的加载器")
 	}
 	cache := filepath.Join(e.versionCacheDir(instance.Version), instance.Loader+"-"+instance.Build+".json")
 	var overlay gameProfile
-	if readJSON(cache, &overlay) != nil {
+	needsOverlay := instance.Loader != "" && readJSON(cache, &overlay) != nil
+	gameJava := max(base.JavaVersion.MajorVersion, minimumJava)
+	var java, installer string
+	jar := transfer{minecraftClient(base), e.baseVersionFile(base.ID, ".jar")}
+	jobs := []func(context.Context, func(string)) error{
+		func(ctx context.Context, status func(string)) error {
+			if jar.ready() {
+				reportStage(ctx, StageProgress{Label: clientStage, Fraction: 1})
+				return nil
+			}
+			return ensureAll(ctx, []transfer{jar}, clientStage, status)
+		},
+		func(ctx context.Context, status func(string)) error {
+			return trackStage(ctx, javaStage, func(ctx context.Context) error {
+				var err error
+				java, err = e.EnsureJava(ctx, gameJava, status)
+				return err
+			})
+		},
+	}
+	loaderSteps := loaderStages(instance.Loader)
+	if needsOverlay {
+		label := loaderSteps[0]
+		jobs = append(jobs, func(ctx context.Context, status func(string)) error {
+			return trackStage(ctx, label, func(ctx context.Context) error {
+				if usesInstaller {
+					var err error
+					installer, err = e.downloadForgeFamilyInstaller(ctx, instance, name, status)
+					return err
+				}
+				status("正在" + label + "…")
+				addr := source + url.PathEscape(instance.Version) + "/" + url.PathEscape(instance.Build) + "/profile/json"
+				if instance.Loader == "fabric" {
+					return mirroredJSON(ctx, bmcl+"/fabric-meta/v2/versions/loader/"+strings.TrimPrefix(addr, loaderURL("fabric")), addr, &overlay)
+				}
+				return fetchJSON(ctx, addr, &overlay)
+			})
+		})
+	} else {
+		for _, label := range loaderSteps {
+			reportStage(ctx, StageProgress{Label: label, Fraction: 1})
+		}
+	}
+	if err := runParallel(ctx, status, jobs...); err != nil {
+		return base, "", err
+	}
+	if instance.Loader == "" {
+		return base, java, nil
+	}
+	if needsOverlay {
 		if usesInstaller {
-			overlay, err = e.installForgeFamily(ctx, instance, base, status)
-		} else {
-			addr := source + url.PathEscape(instance.Version) + "/" + url.PathEscape(instance.Build) + "/profile/json"
-			if instance.Loader == "fabric" {
-				err = mirroredJSON(ctx, bmcl+"/fabric-meta/v2/versions/loader/"+strings.TrimPrefix(addr, loaderURL("fabric")), addr, &overlay)
-			} else {
-				err = fetchJSON(ctx, addr, &overlay)
+			var err error
+			installerJava := java
+			if gameJava != base.JavaVersion.MajorVersion {
+				installerJava, err = e.EnsureJava(ctx, base.JavaVersion.MajorVersion, status)
+				if err != nil {
+					return base, "", err
+				}
+			}
+			overlay, err = e.installForgeFamily(ctx, instance, base, name, installer, installerJava, status)
+			if err != nil {
+				return base, "", err
 			}
 		}
-		if err != nil {
-			return base, err
-		}
 		if overlay.InheritsFrom != base.ID || overlay.MainClass == "" {
-			return base, fmt.Errorf("加载器版本描述无效")
+			return base, "", fmt.Errorf("加载器版本描述无效")
 		}
 		if err := writeJSON(cache, overlay); err != nil {
-			return base, err
+			return base, "", err
 		}
 	}
 	base.MainClass = overlay.MainClass
@@ -275,7 +360,7 @@ func (e Engine) profile(ctx context.Context, instance Instance, status func(stri
 	base.Libraries = mergeLibraries(base.Libraries, overlay.Libraries)
 	base.Arguments.JVM = append(base.Arguments.JVM, overlay.Arguments.JVM...)
 	base.Arguments.Game = append(base.Arguments.Game, overlay.Arguments.Game...)
-	return base, nil
+	return base, java, nil
 }
 
 func mergeLibraries(base, overlay []library) []library {
@@ -384,8 +469,7 @@ type assetIndex struct {
 }
 
 func (e Engine) installGame(ctx context.Context, instance Instance, status func(string)) (gameProfile, error) {
-	status("正在读取版本信息…")
-	profile, err := e.profile(ctx, instance, status)
+	profile, _, err := e.prepareGame(ctx, instance, 0, status)
 	if err != nil {
 		return profile, err
 	}
@@ -393,20 +477,25 @@ func (e Engine) installGame(ctx context.Context, instance Instance, status func(
 	if err != nil {
 		return profile, err
 	}
-	assets, err := e.assetTransfers(ctx, profile)
-	if err != nil {
-		return profile, err
-	}
-	return profile, ensureAll(ctx, append(packages, assets...), "下载 Minecraft、运行库和资源", status)
+	return profile, runParallel(ctx, status, func(ctx context.Context, status func(string)) error {
+		return ensureAll(ctx, packages, librariesStage, status)
+	}, func(ctx context.Context, status func(string)) error {
+		assets, err := e.assetTransfers(ctx, profile, status)
+		if err != nil {
+			return err
+		}
+		return ensureAll(ctx, assets, assetsStage, status)
+	})
 }
 
-func (e Engine) assetTransfers(ctx context.Context, profile gameProfile) ([]transfer, error) {
+func (e Engine) assetTransfers(ctx context.Context, profile gameProfile, status func(string)) ([]transfer, error) {
 	if !segment(profile.AssetIndex.ID) || profile.AssetIndex.URL == "" {
 		return nil, fmt.Errorf("版本缺少资源索引")
 	}
 	assets := filepath.Join(e.gameRoot(), "assets")
 	indexPath := filepath.Join(assets, "indexes", profile.AssetIndex.ID+".json")
-	if err := (transfer{withMinecraftMirror(profile.AssetIndex.artifact, minecraftMirror(profile.AssetIndex.URL)), indexPath}).ensure(ctx); err != nil {
+	indexFile := transfer{withMinecraftMirror(profile.AssetIndex.artifact, minecraftMirror(profile.AssetIndex.URL)), indexPath}
+	if err := ensureAll(ctx, []transfer{indexFile}, assetIndexStage, status); err != nil {
 		return nil, err
 	}
 	var index assetIndex
@@ -443,7 +532,7 @@ func (e Engine) versionCacheDir(version string) string {
 	if e.GameRoot == "" {
 		return filepath.Join(e.gameRoot(), "versions", version)
 	}
-	return filepath.Join(e.GameRoot, ".hjml-cache", "versions", version)
+	return filepath.Join(e.cacheDir(), "versions", version)
 }
 
 func (e Engine) moveLegacyVersionCache(version string) error {

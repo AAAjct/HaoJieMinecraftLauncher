@@ -185,7 +185,7 @@ func TestConcurrentJavaInstallReusesJDK21(t *testing.T) {
 	close(proceed)
 	check(first, 21)
 	check(third, 21)
-	if entries, err := os.ReadDir(filepath.Join(e.gameRoot(), ".hjm-cache", "temp")); err != nil || len(entries) != 0 {
+	if entries, err := os.ReadDir(filepath.Join(e.gameRoot(), ".hjml-cache", "temp")); err != nil || len(entries) != 0 {
 		t.Fatalf("JDK staging files remain: %v (%v)", entries, err)
 	}
 	mu.Lock()

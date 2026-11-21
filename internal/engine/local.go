@@ -39,8 +39,7 @@ func installFabricAPI(ctx context.Context, instance Instance, game string, statu
 	if err != nil {
 		return err
 	}
-	status("正在下载 Fabric API · " + file.Filename)
-	return file.transfer(dir).ensure(ctx)
+	return ensureAll(ctx, []transfer{file.transfer(dir)}, fabricAPIStage, status)
 }
 
 func readModJSON(path string, meta any) error {

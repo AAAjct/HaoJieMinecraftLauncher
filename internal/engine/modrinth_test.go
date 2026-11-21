@@ -219,7 +219,8 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	}
 
 	const mod = "fixture jar"
-	const webMod = "fixture jar from CurseForge website"
+	const webMod = "fixture jar from CurseForge download-url API"
+	const localMod = "fixture jar from CDN fallback"
 	const cdn = "https://edge.forgecdn.net/files/12/34/mod.jar"
 	const webCDN = "https://edge.forgecdn.net/files/12/35/web.jar?grant=test"
 	t.Setenv("CURSEFORGE_API_KEY", "test-key")
@@ -236,29 +237,38 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 		case "api.curseforge.com/v1/mods/files":
 			request, err := io.ReadAll(req.Body)
 			req.Body.Close()
-			if err != nil || string(request) != `{"fileIds":[1234,1235]}` || req.Header.Get("X-Api-Key") != "test-key" {
+			if err != nil || string(request) != `{"fileIds":[1234,1235,1236]}` || req.Header.Get("X-Api-Key") != "test-key" {
 				return nil, fmt.Errorf("invalid official metadata request")
 			}
-			body = fmt.Sprintf(`{"data":[{"id":1234,"modId":42,"fileName":"mod.jar","downloadUrl":%q,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]},{"id":1235,"modId":43,"fileName":"web.jar","downloadUrl":null,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}]}`,
-				cdn, len(mod), sha1.Sum([]byte(mod)), len(webMod), sha1.Sum([]byte(webMod)))
-		case "mod.mcimirror.top/files/12/34/mod.jar":
+			return nil, context.DeadlineExceeded
+		case "mod.mcimirror.top/curseforge/v1/mods/42/files/1234":
+			body = fmt.Sprintf(`{"data":{"id":1234,"modId":42,"fileName":"mod.jar","downloadUrl":%q,"fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, cdn, len(mod), sha1.Sum([]byte(mod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/43/files/1235":
+			body = fmt.Sprintf(`{"data":{"id":1235,"modId":43,"fileName":"web.jar","fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, len(webMod), sha1.Sum([]byte(webMod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/44/files/1236":
+			body = fmt.Sprintf(`{"data":{"id":1236,"modId":44,"fileName":"local.jar","fileLength":%d,"hashes":[{"algo":1,"value":"%x"}]}}`, len(localMod), sha1.Sum([]byte(localMod)))
+		case "mod.mcimirror.top/curseforge/v1/mods/43/files/1235/download-url":
 			if req.Header.Get("X-Api-Key") != "" {
 				return nil, fmt.Errorf("official key sent to mirror")
 			}
-			code = http.StatusNotFound
-		case "edge.forgecdn.net/files/12/34/mod.jar":
+			body = `{"data":""}`
+		case "mediafilez.forgecdn.net/files/12/34/mod.jar":
 			if req.Header.Get("X-Api-Key") != "test-key" {
 				return nil, fmt.Errorf("missing official CDN key")
 			}
 			body = mod
-		case "www.curseforge.com/api/v1/mods/43/files/1235/download":
-			if req.Header.Get("X-Api-Key") != "" {
-				return nil, fmt.Errorf("official key sent to website")
-			}
-			return &http.Response{StatusCode: http.StatusTemporaryRedirect, Header: http.Header{"Location": {webCDN}}, Body: http.NoBody, Request: req}, nil
+		case "api.curseforge.com/v1/mods/43/files/1235/download-url":
+			body = fmt.Sprintf(`{"data":%q}`, webCDN)
+		case "mod.mcimirror.top/curseforge/v1/mods/44/files/1236/download-url",
+			"api.curseforge.com/v1/mods/44/files/1236/download-url":
+			body = `{"data":""}`
+		case "mediafilez.forgecdn.net/files/1/236/local.jar":
+			body = localMod
+		case "mod.mcimirror.top/files/12/35/web.jar":
+			code = http.StatusNotFound
 		case "edge.forgecdn.net/files/12/35/web.jar":
 			if req.URL.String() != webCDN {
-				return nil, fmt.Errorf("invalid website download redirect")
+				return nil, fmt.Errorf("download-url did not retain the query")
 			}
 			body = webMod
 		default:
@@ -272,7 +282,14 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.WriteString(entry, `{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Curse ZIP","minecraft":{"version":"test-version"},"files":[{"projectID":42,"fileID":1234,"required":true},{"projectID":43,"fileID":1235,"required":true}]}`); err != nil {
+	if _, err := io.WriteString(entry, `{"manifestType":"minecraftModpack","manifestVersion":1,"name":"Curse ZIP","minecraft":{"version":"test-version"},"files":[{"projectID":42,"fileID":1234,"required":true},{"projectID":43,"fileID":1235,"required":true},{"projectID":44,"fileID":1236,"required":true}]}`); err != nil {
+		t.Fatal(err)
+	}
+	legacyEntry, err := z.Create("overrides/tacz/[\xc0\xb6\xb9\xde\xc7\xfa\xc6\xe6] Blue-tin cookie v1.3.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(legacyEntry, "nested ZIP fixture"); err != nil {
 		t.Fatal(err)
 	}
 	if err := z.Close(); err != nil {
@@ -300,7 +317,13 @@ func TestCurseForgePackImportsZIPAndRAR(t *testing.T) {
 	}
 	result, err = os.ReadFile(filepath.Join(e.GameDir(instance), "mods", "web.jar"))
 	if err != nil || string(result) != webMod {
-		t.Fatalf("ZIP import through website: %q, %v", result, err)
+		t.Fatalf("ZIP import through download-url: %q, %v", result, err)
+	}
+	if result, err := os.ReadFile(filepath.Join(expectedDir, "mods", "local.jar")); err != nil || string(result) != localMod {
+		t.Fatalf("ZIP import through CDN fallback: %q, %v", result, err)
+	}
+	if result, err := os.ReadFile(filepath.Join(expectedDir, "tacz", "[蓝罐曲奇] Blue-tin cookie v1.3.zip")); err != nil || string(result) != "nested ZIP fixture" {
+		t.Fatalf("ZIP import with GBK filename: %q, %v", result, err)
 	}
 }
 
@@ -330,7 +353,7 @@ func TestCanceledPackRemovesItsNamedDirectory(t *testing.T) {
 	e := packTestEngine(t)
 	ctx, cancel := context.WithCancelCause(t.Context())
 	defer cancel(nil)
-	_, err := e.createInstance(ctx, Instance{Version: "test-version"}, "Canceled Pack.zip", func(game string) error {
+	_, err := e.createInstance(ctx, Instance{Version: "test-version"}, "Canceled Pack.zip", func(ctx context.Context, game string, _ func(string)) error {
 		if filepath.Base(game) != "Canceled Pack" {
 			t.Errorf("pack downloaded into %s", game)
 		}

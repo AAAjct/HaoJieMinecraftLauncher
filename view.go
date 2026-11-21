@@ -74,7 +74,11 @@ func (a *app) view(c *ui.Context) {
 			}
 			ui.Column(c).Grow(1).Clip().Children(func() {
 				if a.page != launchPage {
-					ui.Scroll(c).Key(scrollKey).Transition(pageMotion).TrackScroll(&a.mainScroll).Grow(1).Padding(18, 62, 18, 18).Children(func() {
+					rightPadding := float32(62)
+					if a.page == tasksPage {
+						rightPadding = 24
+					}
+					ui.Scroll(c).Key(scrollKey).Transition(pageMotion).TrackScroll(&a.mainScroll).Grow(1).Padding(18, rightPadding, 18, 18).Children(func() {
 						ui.Column(c).Gap(12).Children(func() {
 							switch a.page {
 							case downloadsPage:
@@ -112,6 +116,9 @@ func (a *app) view(c *ui.Context) {
 		ui.Column(c).Background(ui.Hex("#182333")).Children(func() {
 			downloads := a.downloadCount()
 			for _, kind := range []jobKind{downloadJob, launchJob, catalogJob} {
+				if a.page == tasksPage && kind == downloadJob {
+					continue
+				}
 				task := a.activeJob(kind)
 				if task == nil {
 					continue
@@ -137,6 +144,7 @@ func (a *app) view(c *ui.Context) {
 		})
 		a.importDialog(c)
 		a.deleteInstanceDialog(c)
+		a.crashDialog(c)
 	})
 }
 
